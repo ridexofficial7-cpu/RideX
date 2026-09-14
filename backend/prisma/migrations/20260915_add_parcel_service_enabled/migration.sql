@@ -1,0 +1,1 @@
+ALTER TABLE "Driver" ADD COLUMN IF NOT EXISTS "parcelServiceEnabled" BOOLEAN NOT NULL DEFAULT true;

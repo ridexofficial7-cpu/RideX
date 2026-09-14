@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "RideX Customer",
+    "slug": "ridex-customer",
+    "version": "5.6.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "android": {
+      "package": "com.ridex.customer",
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "com.ridex.customer",
+      "infoPlist": {
+        "NSCameraUsageDescription": "RideX uses the camera so you can save photos in your Gallery."
+      }
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "RideX needs access to your photos so you can select and save profile images.",
+          "cameraPermission": "RideX uses the camera so you can take profile images.",
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "RideX uses your location to find your pickup point and connect you with nearby drivers."
+        }
+      ],
+      "expo-camera"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "2bf7fb0d-75b6-4f1e-9e25-5545764298cc"
+      }
+    }
+  }
+}

@@ -1,0 +1,4 @@
+D:\App plaing\new\RideX\backend\.env
+D:\App plaing\new\RideX\backend\.env.example
+D:\App plaing\new\RideX\backend\.env.production.example
+D:\App plaing\new\RideX\backend\.env.test.example

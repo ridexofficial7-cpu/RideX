@@ -1,0 +1,13 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ridex
+    ports:
+      - "5432:5432"
+    volumes:
+      - ridex_pg:/var/lib/postgresql/data
+volumes:
+  ridex_pg:

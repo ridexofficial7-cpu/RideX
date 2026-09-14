@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "RideX Driver",
+    "slug": "ridex-driver",
+    "version": "5.6.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "RideX Driver needs your location to find nearby rides and share your live location during active trips."
+        }
+      ]
+    ],
+    "android": {
+      "package": "com.ridex.driver"
+    },
+    "ios": {
+      "bundleIdentifier": "com.ridex.driver"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "19bcd504-a53c-4c3c-9182-32a1d30e7ae8"
+      }
+    }
+  }
+}

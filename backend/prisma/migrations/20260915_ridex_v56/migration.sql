@@ -1,0 +1,10 @@
+ALTER TABLE "Booking" ADD COLUMN IF NOT EXISTS "pickupZoneId" TEXT;
+ALTER TABLE "Booking" ADD COLUMN IF NOT EXISTS "dropZoneId" TEXT;
+ALTER TABLE "Booking" ADD COLUMN IF NOT EXISTS "sharedGroupId" TEXT;
+ALTER TABLE "BookingLeg" ADD COLUMN IF NOT EXISTS "handoverFromDriverId" TEXT;
+ALTER TABLE "BookingLeg" ADD COLUMN IF NOT EXISTS "handoverToDriverId" TEXT;
+ALTER TABLE "BookingLeg" ADD COLUMN IF NOT EXISTS "handoverAt" TIMESTAMP(3);
+ALTER TABLE "BookingLeg" ADD COLUMN IF NOT EXISTS "connectionPointZoneId" TEXT;
+CREATE INDEX IF NOT EXISTS "Booking_environment_sharedGroup_idx" ON "Booking"("environment","sharedGroupId");
+CREATE INDEX IF NOT EXISTS "Booking_zone_pair_idx" ON "Booking"("pickupZoneId","dropZoneId","status");
+CREATE INDEX IF NOT EXISTS "BookingLeg_handover_idx" ON "BookingLeg"("handoverToDriverId","status");
