@@ -43,6 +43,7 @@ model Customer {
   sosEvents         SosEvent[]
   supportCases      SupportCase[]
   tripPassengers    TripPassenger[]
+  bookingShareMembers BookingShareMember[]
 }
 
 model CustomerGalleryPhoto {
@@ -84,6 +85,7 @@ model Driver {
   driverStatus         DriverStatus             @default(OFFLINE)
   dailyServiceMode     ServiceMode              @default(BOTH)
   serviceModeUpdatedAt DateTime?
+  parcelServiceEnabled Boolean @default(true)
   rating               Float                    @default(5)
   totalRides           Int                      @default(0)
   createdAt            DateTime                 @default(now())
@@ -218,6 +220,12 @@ model Booking {
   couponCode            String?
   couponDiscount        Decimal               @default(0) @db.Decimal(12, 2)
   dropLocationImageUrl  String?
+  requestedDurationMinutes Int?
+  serviceSubtype          String?
+  environment             String @default("TEST")
+  pickupZoneId            String?
+  dropZoneId              String?
+  sharedGroupId           String?
   assignedDriver        Driver?               @relation("BookingDriver", fields: [assignedDriverId], references: [id])
   coupon                Coupon?               @relation(fields: [couponId], references: [id])
   customer              Customer              @relation(fields: [customerId], references: [id])
@@ -241,10 +249,14 @@ model Booking {
   sosEvents             SosEvent[]
   supportCases          SupportCase[]
   tripPassengers        TripPassenger[]
+  parcelItems            ParcelItem[]
+  shareMembers           BookingShareMember[]
 
   @@index([customerId, createdAt])
   @@index([status, bookingType, rideType])
   @@index([assignedDriverId, status])
+  @@index([environment, sharedGroupId])
+  @@index([pickupZoneId, dropZoneId, status])
 }
 
 model BookingLeg {
@@ -264,6 +276,18 @@ model BookingLeg {
   finalFare     Decimal?      @db.Decimal(12, 2)
   tripPin       String?
   tripId        String?       @unique
+  verificationMethod       String   @default("OTP")
+  verificationTokenHash    String?
+  verificationExpiresAt    DateTime?
+  verificationUsedAt       DateTime?
+  verificationCustomerId   String?
+  verificationDriverId     String?
+  handoverStatus           String   @default("NOT_REQUIRED")
+  maxDistanceKm            Float?
+  connectionPointZoneId    String?
+  handoverFromDriverId     String?
+  handoverToDriverId       String?
+  handoverAt               DateTime?
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
   booking       Booking       @relation(fields: [bookingId], references: [id])
@@ -275,6 +299,7 @@ model BookingLeg {
 
   @@unique([bookingId, sequence])
   @@index([driverId, status])
+  @@index([handoverToDriverId, status])
 }
 
 model RideRequest {
@@ -835,6 +860,181 @@ model AuthSession {
   @@index([userId, userType])
   @@index([expiresAt])
   @@index([revokedAt])
+}
+
+model CityZone {
+  id              String   @id @default(cuid())
+  name            String
+  city            String
+  country         String   @default("IN")
+  centerLat       Float
+  centerLng       Float
+  radiusKm        Float
+  active          Boolean  @default(true)
+  connectionPoint Boolean  @default(true)
+  metadata        Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  pricingRules    PricingRule[]
+
+  @@index([city, active])
+}
+
+model PricingRule {
+  id               String       @id @default(cuid())
+  name             String
+  active           Boolean      @default(true)
+  serviceType      String?
+  bookingType      BookingType?
+  rideType         RideType?
+  vehicleType      VehicleType?
+  zoneId           String?
+  dayOfWeek        String?
+  startTime        String?
+  endTime          String?
+  demandMin        Int?
+  demandMax        Int?
+  minFare          Decimal?     @db.Decimal(12,2)
+  maxFare          Decimal?     @db.Decimal(12,2)
+  baseFare         Decimal?     @db.Decimal(12,2)
+  perKm            Decimal?     @db.Decimal(12,2)
+  perMinute        Decimal?     @db.Decimal(12,2)
+  waitingPerMinute Decimal?     @db.Decimal(12,2)
+  weightPerKg      Decimal?     @db.Decimal(12,2)
+  multiplier       Decimal      @default(1) @db.Decimal(8,4)
+  priority         Int          @default(0)
+  metadata         Json?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  zone             CityZone?    @relation(fields: [zoneId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([active, priority])
+  @@index([serviceType, vehicleType, active])
+}
+
+model ParcelItem {
+  id            String   @id @default(cuid())
+  bookingId     String
+  sequence      Int      @default(1)
+  weightKg      Float
+  description   String?
+  pickupAddress String
+  pickupLat     Float
+  pickupLng     Float
+  dropAddress   String
+  dropLat       Float
+  dropLng       Float
+  status        String   @default("PENDING")
+  pickedUpAt   DateTime?
+  deliveredAt  DateTime?
+  receiverName String?
+  receiverMobile String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  booking       Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([bookingId, sequence])
+}
+
+model BookingShareMember {
+  id            String    @id @default(cuid())
+  bookingId     String
+  customerId    String?
+  pickupSequence Int      @default(1)
+  dropSequence   Int      @default(1)
+  seatCount      Int      @default(1)
+  status         String   @default("WAITING")
+  boardedAt      DateTime?
+  droppedAt      DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  booking        Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  customer       Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([bookingId, status])
+}
+
+model ApprovedTester {
+  id         String   @id @default(cuid())
+  mobile     String   @unique
+  label      String?
+  active     Boolean  @default(true)
+  approvedAt DateTime @default(now())
+  approvedBy String?
+  revokedAt  DateTime?
+  lastSeenAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([active, mobile])
+}
+
+model EnvironmentControl {
+  id               String   @id @default(cuid())
+  key              String   @unique
+  activeEnvironment String   @default("TEST")
+  testApiBaseUrl   String?
+  liveApiBaseUrl   String?
+  currentVersion   String?
+  approvedVersion  String?
+  deploymentStatus String   @default("TESTING")
+  updatedByAdminId String?
+  updatedAt        DateTime @updatedAt
+  createdAt        DateTime @default(now())
+}
+
+model ProjectRelease {
+  id               String   @id @default(cuid())
+  version          String   @unique
+  sourceLabel      String?
+  checksum         String?
+  sourceHash       String?
+  status           String   @default("UPLOADED")
+  environment      String   @default("TEST")
+  testStartedAt    DateTime?
+  testCompletedAt  DateTime?
+  approvedAt       DateTime?
+  deployedAt       DateTime?
+  approvedByAdminId String?
+  notes            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  testRuns         TestRun[]
+
+  @@index([environment, status, createdAt])
+}
+
+model TestRun {
+  id           String          @id @default(cuid())
+  releaseId    String?
+  testerMobile String?
+  name         String
+  status       String          @default("RUNNING")
+  passed       Int             @default(0)
+  failed       Int             @default(0)
+  errors       Int             @default(0)
+  startedAt    DateTime        @default(now())
+  completedAt  DateTime?
+  results      Json?
+  release      ProjectRelease? @relation(fields: [releaseId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([status, startedAt])
+}
+
+model DataMergeJob {
+  id             String   @id @default(cuid())
+  name           String
+  sourceScope    String   @default("HISTORICAL_CURRENT")
+  sourceQuery    Json?
+  derivativeData Json?
+  status         String   @default("DRAFT")
+  reviewed       Boolean  @default(false)
+  reviewedBy     String?
+  mergedAt       DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([status, createdAt])
 }
 
 enum UserType {

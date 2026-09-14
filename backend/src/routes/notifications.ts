@@ -368,7 +368,7 @@ router.post(
         authUserId
           ? { userId: authUserId }
           : await resolveRecipient({
-              userId,
+              userId: userId || authUserId,
               actorType,
               actorId,
             });
@@ -544,7 +544,7 @@ router.get(
 
       const recipient =
         await resolveRecipient({
-          userId,
+          userId: userId || authUserId,
           actorType,
           actorId,
         });
@@ -1170,3 +1170,4 @@ router.delete(
 export {
   router as notificationsRouter,
 };
+
