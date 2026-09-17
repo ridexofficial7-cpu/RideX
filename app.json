@@ -5,6 +5,7 @@
     "version": "7.2.0",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
+
     "android": {
       "package": "com.ridex.app",
       "googleServicesFile": "./google-services.json",
@@ -15,12 +16,14 @@
         "android.permission.RECORD_AUDIO"
       ]
     },
+
     "ios": {
       "bundleIdentifier": "com.ridex.app",
       "infoPlist": {
         "NSCameraUsageDescription": "RideX uses the camera for QR verification and profile/gallery features."
       }
     },
+
     "plugins": [
       [
         "expo-image-picker",
@@ -45,10 +48,13 @@
         }
       ]
     ],
+
     "extra": {
       "eas": {
         "projectId": "08ea2ca5-b77d-4a3b-bf59-cff62c3a77be"
       }
-    }
+    },
+
+    "owner": "ridex07"
   }
 }
