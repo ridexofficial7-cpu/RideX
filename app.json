@@ -1,0 +1,54 @@
+{
+  "expo": {
+    "name": "RideX",
+    "slug": "ridex",
+    "version": "7.2.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "android": {
+      "package": "com.ridex.app",
+      "googleServicesFile": "./google-services.json",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "com.ridex.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "RideX uses the camera for QR verification and profile/gallery features."
+      }
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "RideX needs access to your photos.",
+          "cameraPermission": "RideX uses the camera for profile and QR features.",
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "RideX uses location for pickup, matching and live active rides."
+        }
+      ],
+      "expo-camera",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icons/01_notification.png",
+          "color": "#0AA35A"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "08ea2ca5-b77d-4a3b-bf59-cff62c3a77be"
+      }
+    }
+  }
+}

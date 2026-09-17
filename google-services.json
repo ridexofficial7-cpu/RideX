@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "750073381669",
+    "project_id": "ridex-test",
+    "storage_bucket": "ridex-test.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:750073381669:android:a5ec1cf27592c0662350cc",
+        "android_client_info": {
+          "package_name": "com.ridex.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDlbmgWAOTbdvHvJs5INGoVDkr_oFQzQp8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
