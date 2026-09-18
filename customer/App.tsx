@@ -2,6 +2,7 @@ import type { CustomerScreen } from "../navigation/routes";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   BackHandler,
   Image,
   Linking,
@@ -22,7 +23,7 @@ import QRCode from "react-native-qrcode-svg";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { createRideXFetch, getRideXApiUrl } from "../shared/api/client";
 import { registerRideXPushToken } from "../pushNotifications";
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE, MapType } from "react-native-maps";
+import MapView, { Marker, PROVIDER_GOOGLE, MapType } from "react-native-maps";
 import { CUSTOMER_ASSETS } from "../shared/assets";
 
 
@@ -233,10 +234,10 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
 
   const [pickup, setPickup] = useState("");
   const [drop, setDrop] = useState("");
-  const [pickupLat, setPickupLat] = useState(25.5392);
-  const [pickupLng, setPickupLng] = useState(87.5717);
-  const [dropLat, setDropLat] = useState(25.5480);
-  const [dropLng, setDropLng] = useState(87.5790);
+  const [pickupLat, setPickupLat] = useState(Number.NaN);
+  const [pickupLng, setPickupLng] = useState(Number.NaN);
+  const [dropLat, setDropLat] = useState(Number.NaN);
+  const [dropLng, setDropLng] = useState(Number.NaN);
   const [userLocation, setUserLocation] = useState<{
     latitude: number;
     longitude: number;
@@ -515,6 +516,12 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
       setLocationLoading(false);
     }
   }
+
+  useEffect(() => {
+    if (screen === "home" && !pickup.trim()) {
+      void refreshCurrentLocation(true);
+    }
+  }, [screen]);
 
   useEffect(() => {
     if (screen !== "location" && screen !== "confirmed") {
@@ -1051,14 +1058,40 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
     setScreen("rideType");
   }
 
+  async function selectDestinationFromMap(latitude: number, longitude: number) {
+    try {
+      setDropLat(latitude);
+      setDropLng(longitude);
+      setDrop("Selected location");
+      setMessage("Destination selected. Resolving address...");
+
+      const results = await Location.reverseGeocodeAsync({ latitude, longitude });
+      const place = results?.[0];
+      if (place) {
+        const parts = [place.name, place.street, place.district, place.city, place.region]
+          .filter((part, index, arr) => part && arr.indexOf(part) === index);
+        if (parts.length) setDrop(parts.join(", "));
+      }
+      setMessage("Destination selected on map.");
+    } catch (error) {
+      console.error("CUSTOMER DESTINATION REVERSE GEOCODE ERROR:", error);
+      setMessage("Destination selected on map.");
+    }
+  }
+
   function continueFromLocation() {
     if (!pickup.trim()) {
       setMessage("Please enter pickup location.");
       return;
     }
 
-    if (!drop.trim()) {
-      setMessage("Please enter drop location.");
+    if (!drop.trim() || !Number.isFinite(dropLat) || !Number.isFinite(dropLng)) {
+      setMessage("Please select a destination on the map or choose a saved/quick location.");
+      return;
+    }
+
+    if (!Number.isFinite(pickupLat) || !Number.isFinite(pickupLng)) {
+      setMessage("Please set your current pickup location first.");
       return;
     }
 
@@ -1865,11 +1898,25 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
           <Card>
             <View style={s.sectionHeaderRow}>
               <Text style={s.sectionTitleLarge}>📍 Where are you going?</Text>
-              <PillButton label="🗺 On Map" />
+              <PillButton label="🗺 On Map" onPress={() => setScreen("location")} />
             </View>
             <View style={s.routeInputCard}>
-              <RoutePoint active color={COLORS.blue} title="Your current location" value={pickup || "Boring Road, Patna"} />
-              <RoutePoint color={COLORS.red} title="Enter destination" value={drop || "Search location, area or landmark"} />
+              <RoutePoint
+                active
+                color={COLORS.blue}
+                title="Your current location"
+                value={pickup || "Detecting current location…"}
+                onPress={() => {
+                  void refreshCurrentLocation(true);
+                  setScreen("location");
+                }}
+              />
+              <RoutePoint
+                color={COLORS.red}
+                title="Enter destination"
+                value={drop || "Search location, area or landmark"}
+                onPress={() => setScreen("location")}
+              />
             </View>
             <View style={[s.routeInputCard,{marginTop:12}]}>
               <Text style={s.cardTitle}>Booking Duration</Text>
@@ -1880,13 +1927,13 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
           </Card>
 
           <Card style={{ backgroundColor: COLORS.mapBg }}>
-            <FakeMap
+            <RideXMap
               pickupLat={pickupLat}
               pickupLng={pickupLng}
               dropLat={dropLat}
               dropLng={dropLng}
-              pickupLabel={pickup || "Boring Road"}
-              dropLabel={drop || "Patna Junction"}
+              pickupLabel={pickup}
+              dropLabel={drop}
               showVehicles
               compact
               currentLocation={userLocation}
@@ -1941,20 +1988,21 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
       <ScreenShell scroll>
         <HeaderBar title="Choose Location" onBack={goBack} right={<TopLanguage />} />
         <View style={s.mapLargeWrap}>
-          <FakeMap
+          <RideXMap
             pickupLat={pickupLat}
             pickupLng={pickupLng}
             dropLat={dropLat}
             dropLng={dropLng}
-            pickupLabel={pickup || "Boring Road, Patna"}
-            dropLabel={drop || "Patna Junction, Patna"}
+            pickupLabel={pickup}
+            dropLabel={drop}
             showVehicles
             currentLocation={userLocation}
             onCurrentLocationPress={() => { void refreshCurrentLocation(true); }}
+            onMapPress={(coordinate) => { void selectDestinationFromMap(coordinate.latitude, coordinate.longitude); }}
           />
           <View style={s.mapTopInputs}>
-            <RoutePoint color={COLORS.red} title="Pickup Location" value={pickup || "Boring Road, Patna"} />
-            <RoutePoint color={COLORS.red} title="Destination" value={drop || "Patna Junction, Patna"} />
+            <RoutePoint color={COLORS.red} title="Pickup Location" value={pickup || "Getting current location..."} />
+            <RoutePoint color={COLORS.red} title="Destination" value={drop || "Tap the map to select destination"} />
           </View>
                     <Pressable
             style={[s.mapCenterButton, locationLoading && s.mapCenterButtonLoading]}
@@ -1992,14 +2040,24 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
               style={s.compactInput}
               placeholder="Pickup location"
               value={pickup}
-              onChangeText={setPickup}
+              onChangeText={(value) => {
+                setPickup(value);
+                if (value.trim() !== "Current location") {
+                  setPickupLat(Number.NaN);
+                  setPickupLng(Number.NaN);
+                }
+              }}
               placeholderTextColor={COLORS.muted}
             />
             <TextInput
               style={s.compactInput}
               placeholder="Destination"
               value={drop}
-              onChangeText={setDrop}
+              onChangeText={(value) => {
+                setDrop(value);
+                setDropLat(Number.NaN);
+                setDropLng(Number.NaN);
+              }}
               placeholderTextColor={COLORS.muted}
             />
           </View>
@@ -2065,11 +2123,11 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
       <ScreenShell>
         <HeaderBar title="Choose Your Ride" onBack={goBack} right={<TopLanguage />} />
         <View style={s.rideMapTop}>
-          <FakeMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup || "Boring Road, Patna"} dropLabel={drop || "Patna Junction, Patna"} showVehicles />
+          <RideXMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup} dropLabel={drop} showVehicles />
           <View style={s.routeSummary}>
             <View style={{ flex: 1 }}>
               <RoutePoint color={COLORS.red} title="Pickup" value={pickup || "Boring Road, Patna"} />
-              <RoutePoint color={COLORS.red} title="Drop" value={drop || "Patna Junction, Patna"} />
+              <RoutePoint color={COLORS.red} title="Drop" value={drop || "Tap the map to select destination"} />
             </View>
             <View style={s.distanceBadge}>
               <Text style={s.distanceBig}>{previewDistanceKm.toFixed(1)} km</Text>
@@ -2155,10 +2213,38 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
             </View>
             {scheduled ? (
               <View style={s.scheduleGrid}>
-                <TextInput style={s.scheduleInput} value={scheduleDate} onChangeText={setScheduleDate} placeholder="YYYY-MM-DD" />
-                <TextInput style={s.scheduleInput} value={scheduleTime} onChangeText={setScheduleTime} placeholder="09:00" />
-                <Pressable style={[s.scheduleInput, s.centerPill, schedulePeriod === "AM" && s.chipSelected]} onPress={() => setSchedulePeriod("AM")}><Text>AM</Text></Pressable>
-                <Pressable style={[s.scheduleInput, s.centerPill, schedulePeriod === "PM" && s.chipSelected]} onPress={() => setSchedulePeriod("PM")}><Text>PM</Text></Pressable>
+                <View style={s.scheduleDateTimeRow}>
+                  <TextInput
+                    style={s.scheduleDateInput}
+                    value={scheduleDate}
+                    onChangeText={setScheduleDate}
+                    placeholder="YYYY-MM-DD"
+                    keyboardType="numbers-and-punctuation"
+                    autoCapitalize="none"
+                  />
+                  <TextInput
+                    style={s.scheduleTimeInput}
+                    value={scheduleTime}
+                    onChangeText={setScheduleTime}
+                    placeholder="09:00"
+                    keyboardType="numbers-and-punctuation"
+                    autoCapitalize="none"
+                  />
+                </View>
+                <View style={s.schedulePeriodRow}>
+                  <Pressable
+                    style={[s.schedulePeriodButton, schedulePeriod === "AM" && s.chipSelected]}
+                    onPress={() => setSchedulePeriod("AM")}
+                  >
+                    <Text style={s.schedulePeriodText}>AM</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[s.schedulePeriodButton, schedulePeriod === "PM" && s.chipSelected]}
+                    onPress={() => setSchedulePeriod("PM")}
+                  >
+                    <Text style={s.schedulePeriodText}>PM</Text>
+                  </Pressable>
+                </View>
               </View>
             ) : null}
           </Card>
@@ -2179,11 +2265,11 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
       <ScreenShell>
         <HeaderBar title="Choose Goods Service" onBack={goBack} right={<TopLanguage />} />
         <View style={s.rideMapTop}>
-          <FakeMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup || "Boring Road, Patna"} dropLabel={drop || "Patna Junction, Patna"} showVehicles goods />
+          <RideXMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup} dropLabel={drop} showVehicles goods />
           <View style={s.routeSummary}>
             <View style={{ flex: 1 }}>
               <RoutePoint color={COLORS.red} title="Pickup" value={pickup || "Boring Road, Patna"} />
-              <RoutePoint color={COLORS.red} title="Drop" value={drop || "Patna Junction, Patna"} />
+              <RoutePoint color={COLORS.red} title="Drop" value={drop || "Tap the map to select destination"} />
             </View>
             <View style={s.distanceBadge}>
               <Text style={s.distanceBig}>{previewDistanceKm.toFixed(1)} km</Text>
@@ -2280,13 +2366,13 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
         <HeaderBar title="Review & Confirm" onBack={goBack} right={<SupportPill onPress={() => setScreen("support")} />} />
         <ProgressSteps active={bookingMode === "GOODS" ? "Details" : "Review"} />
         <View style={s.mapReviewTop}>
-          <FakeMap
+          <RideXMap
             pickupLat={pickupLat}
             pickupLng={pickupLng}
             dropLat={dropLat}
             dropLng={dropLng}
-            pickupLabel={pickup || "Boring Road, Patna"}
-            dropLabel={drop || "Patna Junction, Patna"}
+            pickupLabel={pickup}
+            dropLabel={drop}
             showVehicles={false}
             goods={bookingMode === "GOODS"}
             currentLocation={userLocation}
@@ -2490,7 +2576,7 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
             <View style={{ flex: 1 }}>
               <Text style={s.cardTitle}>Pickup & Drop Details</Text>
               <RoutePoint color={COLORS.red} title="Pickup" value={pickup || "Boring Road, Patna"} />
-              <RoutePoint color={COLORS.red} title="Drop" value={drop || "Patna Junction, Patna"} />
+              <RoutePoint color={COLORS.red} title="Drop" value={drop || "Tap the map to select destination"} />
             </View>
             <View style={s.distancePanel}>
               <Text style={s.distanceBig}>{previewDistanceKm.toFixed(1)} km</Text>
@@ -2563,7 +2649,7 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
           </View>
         </View>
 
-        <FakeMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup || "Boring Road, Patna"} dropLabel={drop || "Patna Junction, Patna"} completed />
+        <RideXMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup} dropLabel={drop} completed />
 
         <Card>
           <DriverSummary driverId={driverId} goods={bookingMode === "GOODS"} />
@@ -2721,7 +2807,17 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
             <Text style={s.walletLabel}>Wallet Balance</Text>
             <Text style={s.walletAmount}>₹250.00</Text>
           </View>
-          <PrimaryButton title="+ Add Money" onPress={() => {}} small />
+          <PrimaryButton title="+ Add Money" onPress={() => {
+            Alert.alert(
+              "Add Money",
+              "Choose a supported wallet top-up method.",
+              [
+                { text: "UPI", onPress: () => setMessage("UPI wallet top-up will use the configured payment provider.") },
+                { text: "Wallet", onPress: () => setMessage("Wallet top-up requires a configured payment provider.") },
+                { text: "Cancel", style: "cancel" },
+              ]
+            );
+          }} small />
         </View>
 
         <View style={s.statsRow}>
@@ -2741,7 +2837,30 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
             ["⚙", "Settings", "App preferences, notifications"],
             ["🛡", "Privacy & Security", "Manage your data and security"],
           ].map(([icon,title,sub]) => (
-            <Pressable key={title} style={s.profileRow} onPress={() => title === "My Rides" ? setScreen("rides") : title === "Help & Support" ? setScreen("support") : undefined}>
+            <Pressable
+              key={title}
+              style={s.profileRow}
+              onPress={() => {
+                if (title === "Personal Information") { setScreen("editProfile"); return; }
+                if (title === "Saved Addresses") { setScreen("location"); return; }
+                if (title === "My Rides") { setScreen("rides"); return; }
+                if (title === "Help & Support") { setScreen("support"); return; }
+                if (title === "Payment Methods") {
+                  Alert.alert("Payment Methods", "RideX supports UPI and Wallet. Card payment is not enabled.");
+                  return;
+                }
+                if (title === "Offers & Rewards") {
+                  Alert.alert("Offers & Rewards", "Offers and promotions will appear here when available.");
+                  return;
+                }
+                if (title === "Settings") {
+                  Alert.alert("Settings", "App preferences and notification settings are managed here. Provider-specific settings require backend configuration.");
+                  return;
+                }
+                if (title === "Privacy & Security") {
+                  Alert.alert("Privacy & Security", "Your authenticated RideX session and account data are protected by the RideX backend. Contact Support for account/privacy requests.");
+                }
+              }}>
               <Text style={s.profileRowIcon}>{icon}</Text>
               <View style={{ flex: 1 }}>
                 <Text style={s.profileRowTitle}>{title}</Text>
@@ -2804,7 +2923,9 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
 
         <View style={s.sectionHeaderRow}>
           <Text style={s.sectionTitleLarge}>Frequently Asked Questions</Text>
-          <Text style={s.redText}>View All ›</Text>
+          <Pressable onPress={() => void createSupportCase("Help Center", "Customer requested the full RideX Help Center / FAQ list.", "NORMAL")}>
+            <Text style={s.redText}>View All ›</Text>
+          </Pressable>
         </View>
         {[
           ["🚕", "Booking & Rides", "How to book a ride, cancel a ride, modify booking"],
@@ -2815,7 +2936,24 @@ export default function App({ onBeDriver, onAdminLogin }: { onBeDriver?: () => v
           ["🛡", "Safety & Security", "Safety features, emergency, and reports"],
           ["★", "Offers & Rewards", "Coupons, cashback and promotions"],
         ].map(([icon,title,sub]) => (
-          <Pressable key={title} style={s.faqRow}>
+          <Pressable
+            key={title}
+            style={s.faqRow}
+            onPress={() => {
+              Alert.alert(title, sub, [
+                { text: "Close", style: "cancel" },
+                {
+                  text: "Contact Support",
+                  onPress: () => {
+                    void createSupportCase(
+                      title,
+                      `${sub}. Customer opened this Help Center category.`,
+                      "NORMAL"
+                    );
+                  },
+                },
+              ]);
+            }}>
             <View style={s.faqIcon}><LegacyIcon glyph={icon} size={22}/></View>
             <View style={{flex:1}}><Text style={s.profileRowTitle}>{title}</Text><Text style={s.profileRowSub}>{sub}</Text></View>
             <AssetIcon name="chevron_right" size={16} />
@@ -3027,8 +3165,12 @@ function PrimaryButton({title,onPress,trailing,disabled=false,small=false}:{titl
 function OutlineButton({title,onPress,small=false}:{title:string;onPress:()=>void;small?:boolean}) {
   return <Pressable onPress={onPress} style={[s.outlineBtn,small&&s.outlineBtnSmall]}><Text style={[s.outlineBtnText,small&&s.outlineBtnTextSmall]}>{title}</Text></Pressable>;
 }
-function PillButton({label,red=false}:{label:string;red?:boolean}) {
-  return <View style={[s.pillButton,red&&s.pillButtonRed]}><Text style={[s.pillButtonText,red&&s.pillButtonTextRed]}>{label}</Text></View>;
+function PillButton({label,red=false,onPress}:{label:string;red?:boolean;onPress?:()=>void}) {
+  const content = <Text style={[s.pillButtonText,red&&s.pillButtonTextRed]}>{label}</Text>;
+  if (onPress) {
+    return <Pressable onPress={onPress} style={[s.pillButton,red&&s.pillButtonRed]}>{content}</Pressable>;
+  }
+  return <View style={[s.pillButton,red&&s.pillButtonRed]}>{content}</View>;
 }
 function SocialButton({label}:{label:string}) {
   return <View style={s.socialCircle}><Text style={s.socialCircleText}>{label}</Text></View>;
@@ -3036,8 +3178,12 @@ function SocialButton({label}:{label:string}) {
 function FeatureItem({icon,title,sub}:{icon:string;title:string;sub?:string}) {
   return <View style={s.featureItem}><View style={s.featureIcon}><LegacyIcon glyph={icon} size={25}/></View><Text style={s.featureTitle}>{title}</Text>{sub ? <Text style={s.featureSub}>{sub}</Text> : null}</View>;
 }
-function RoutePoint({color,title,value,active=false}:{color:string;title:string;value:string;active?:boolean}) {
-  return <View style={s.routePoint}><View style={[s.routeDot,{borderColor:color,backgroundColor:color==="#2F80ED"?"#EAF4FF":"#FFF"}]}><View style={[s.routeDotInner,{backgroundColor:color}]}/></View><View style={{flex:1}}><Text style={s.routeTitle}>{title}</Text><Text style={s.routeValue}>{value}</Text></View></View>;
+function RoutePoint({color,title,value,active=false,onPress}:{color:string;title:string;value:string;active?:boolean;onPress?:()=>void}) {
+  const content = <><View style={[s.routeDot,{borderColor:color,backgroundColor:color==="#2F80ED"?"#EAF4FF":"#FFF"}]}><View style={[s.routeDotInner,{backgroundColor:color}]}/></View><View style={{flex:1}}><Text style={s.routeTitle}>{title}</Text><Text style={s.routeValue}>{value}</Text></View></>;
+  if (onPress) {
+    return <Pressable onPress={onPress} style={s.routePoint} accessibilityRole="button">{content}</Pressable>;
+  }
+  return <View style={s.routePoint}>{content}</View>;
 }
 function RideChoice({selected,icon,title,price,onPress}:{selected:boolean;icon:string;title:string;price:string;onPress:()=>void}) {
   return <Pressable onPress={onPress} style={[s.rideChoice,selected&&s.rideChoiceSelected]}><View style={s.rideChoiceIcon}><LegacyIcon glyph={icon} size={34}/></View><Text style={s.rideChoiceTitle}>{title}</Text><Text style={s.rideChoicePrice}>{price}</Text><Text style={s.infoCircle}>i</Text></Pressable>;
@@ -3068,20 +3214,20 @@ function ProgressSteps({active}:{active:string}) {
 function SearchState({goods,pickup,drop,pickupLat,pickupLng,dropLat,dropLng,fare,currentLocation,locationLoading,onCurrentLocationPress}:{goods:boolean;pickup:string;drop:string;pickupLat:number;pickupLng:number;dropLat:number;dropLng:number;fare:number;currentLocation:{latitude:number;longitude:number;accuracy?:number|null;recordedAt?:string}|null;locationLoading:boolean;onCurrentLocationPress?:()=>void}) {
   return <>
     <View style={s.stateHeader}><View style={s.stateIcon}><Text>{goods?"🛻":"🛺"}</Text></View><View style={{flex:1}}><Text style={s.stateTitle}>Finding a Driver for Your {goods?"Goods":"Ride"}</Text><Text style={s.stateSub}>Please wait, we are connecting you with the nearest driver</Text></View></View>
-    <FakeMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup||"Pickup Location"} dropLabel={drop||"Drop Location"} searching goods={goods} currentLocation={currentLocation} locationLoading={locationLoading} onCurrentLocationPress={onCurrentLocationPress} />
+    <RideXMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup||"Pickup Location"} dropLabel={drop||"Drop Location"} searching goods={goods} currentLocation={currentLocation} locationLoading={locationLoading} onCurrentLocationPress={onCurrentLocationPress} />
     <Card><View style={s.stepTrack}>{["Searching for driver","Driver accepting","Driver en route","Arriving at pickup"].map((x,i)=><View style={s.stepNode} key={x}><View style={[s.trackCircle,i===0&&s.trackCircleActive]}><Text>{i===0?"●":" "}</Text></View><Text style={s.trackText}>{x}</Text></View>)}</View></Card>
     <Card><VehicleSummary icon={goods?"🛻":"🛺"} title={goods?"Battery Pickup Truck · Goods":"E-Rickshaw"} fare={`₹${fare}`} meta={goods?"Goods only":"1–4 passengers"}/><Text style={s.muted}>Your booking is being matched with a nearby verified driver.</Text></Card>
   </>;
 }
 function AssignedState({goods,driverId,distanceKm,pickup,drop,pickupLat,pickupLng,dropLat,dropLng,driverLocation,currentLocation,locationLoading,onCurrentLocationPress,onChat,onCancel,onCall,onSafety}:{goods:boolean;driverId:string;distanceKm:number;pickup:string;drop:string;pickupLat:number;pickupLng:number;dropLat:number;dropLng:number;driverLocation:{latitude:number;longitude:number;recordedAt?:string}|null;currentLocation?:{latitude:number;longitude:number;accuracy?:number|null;recordedAt?:string}|null;locationLoading:boolean;onCurrentLocationPress?:()=>void;onChat:()=>void;onCancel:()=>void;onCall:()=>void;onSafety:()=>void}) {
-  return <><View style={s.stateBanner}><View style={s.stateIcon}><Text>{goods?"🛻":"🚕"}</Text></View><View style={{flex:1}}><Text style={s.stateTitle}>Driver Assigned!</Text><Text style={s.stateSub}>Your driver is on the way to pick you up.</Text></View><View style={s.etaBox}><Text style={s.etaBig}>{Math.max(3,Math.round(distanceKm*4))} min</Text><Text style={s.etaSmall}>({distanceKm.toFixed(1)} km away)</Text></View></View><FakeMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup||"Your Pickup Location"} dropLabel={drop||"Patna Junction"} driver goods={goods} driverLocation={driverLocation} currentLocation={currentLocation} locationLoading={locationLoading} onCurrentLocationPress={onCurrentLocationPress}/><Card><DriverSummary driverId={driverId} goods={goods}/><View style={s.driverActions}><Pressable style={s.callBtn} onPress={onCall}><Text style={s.callBtnText}>Call</Text></Pressable><OutlineButton title="💬 Chat" onPress={onChat}/><Pressable style={s.sosQuick} onPress={onSafety}><Text style={s.sosQuickText}>🛡 SOS</Text></Pressable><OutlineButton title="✕ Cancel" onPress={onCancel}/></View><StatusTimeline status="assigned"/></Card></>;
+  return <><View style={s.stateBanner}><View style={s.stateIcon}><Text>{goods?"🛻":"🚕"}</Text></View><View style={{flex:1}}><Text style={s.stateTitle}>Driver Assigned!</Text><Text style={s.stateSub}>Your driver is on the way to pick you up.</Text></View><View style={s.etaBox}><Text style={s.etaBig}>{Math.max(3,Math.round(distanceKm*4))} min</Text><Text style={s.etaSmall}>({distanceKm.toFixed(1)} km away)</Text></View></View><RideXMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup||"Your Pickup Location"} dropLabel={drop || "Destination"} driver goods={goods} driverLocation={driverLocation} currentLocation={currentLocation} locationLoading={locationLoading} onCurrentLocationPress={onCurrentLocationPress}/><Card><DriverSummary driverId={driverId} goods={goods}/><View style={s.driverActions}><Pressable style={s.callBtn} onPress={onCall}><Text style={s.callBtnText}>Call</Text></Pressable><OutlineButton title="💬 Chat" onPress={onChat}/><Pressable style={s.sosQuick} onPress={onSafety}><Text style={s.sosQuickText}>🛡 SOS</Text></Pressable><OutlineButton title="✕ Cancel" onPress={onCancel}/></View><StatusTimeline status="assigned"/></Card></>;
 }
 function ArrivedState({goods,driverLocation,driverId,pickup,drop,pickupLat,pickupLng,dropLat,dropLng,currentLocation,locationLoading,onCurrentLocationPress,onChat,onCancel,onCall,onSafety}:{goods:boolean;driverLocation:{latitude:number;longitude:number;recordedAt?:string}|null;driverId?:string;pickup:string;drop:string;pickupLat:number;pickupLng:number;dropLat:number;dropLng:number;currentLocation?:{latitude:number;longitude:number;accuracy?:number|null;recordedAt?:string}|null;locationLoading:boolean;onCurrentLocationPress?:()=>void;onChat:()=>void;onCancel:()=>void;onCall:()=>void;onSafety:()=>void}) {
-  return <><View style={s.arrivedBanner}><View style={s.arrivedIcon}><Text>✓</Text></View><View style={{flex:1}}><Text style={s.stateTitle}>Driver has arrived!</Text><Text style={s.stateSub}>Your driver is waiting at the pickup location.</Text></View><View style={s.etaBoxGreen}><Text style={s.etaGreenBig}>0 min</Text><Text style={s.etaSmall}>(At your location)</Text></View></View><FakeMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel="Pickup Location" dropLabel={drop||"Patna Junction"} arrived driver goods={goods} driverLocation={driverLocation} currentLocation={currentLocation} locationLoading={locationLoading} onCurrentLocationPress={onCurrentLocationPress}/><Card><DriverSummary driverId={driverId||"test-passenger"} goods={goods}/><View style={s.driverActions}><Pressable style={s.callBtn} onPress={onCall}><Text style={s.callBtnText}>Call</Text></Pressable><OutlineButton title="💬 Chat" onPress={onChat}/><Pressable style={s.sosQuick} onPress={onSafety}><Text style={s.sosQuickText}>🛡 SOS</Text></Pressable><OutlineButton title="✕ Cancel" onPress={onCancel}/></View><StatusTimeline status="assigned"/><Card style={s.pinCard}><Text style={s.pinTitle}>🔒 Start Trip with PIN</Text><Text style={s.pinSub}>Ask the driver for the 4-digit PIN to start your trip.</Text><View style={s.pinBoxes}>{[0,1,2,3].map(i=><View key={i} style={s.pinBox}><Text style={s.pinDash}>—</Text></View>)}</View><Text style={s.blueInfo}>ℹ Check the vehicle and driver details before starting.</Text></Card></Card></>;
+  return <><View style={s.arrivedBanner}><View style={s.arrivedIcon}><Text>✓</Text></View><View style={{flex:1}}><Text style={s.stateTitle}>Driver has arrived!</Text><Text style={s.stateSub}>Your driver is waiting at the pickup location.</Text></View><View style={s.etaBoxGreen}><Text style={s.etaGreenBig}>0 min</Text><Text style={s.etaSmall}>(At your location)</Text></View></View><RideXMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel="Pickup Location" dropLabel={drop || "Destination"} arrived driver goods={goods} driverLocation={driverLocation} currentLocation={currentLocation} locationLoading={locationLoading} onCurrentLocationPress={onCurrentLocationPress}/><Card><DriverSummary driverId={driverId||"test-passenger"} goods={goods}/><View style={s.driverActions}><Pressable style={s.callBtn} onPress={onCall}><Text style={s.callBtnText}>Call</Text></Pressable><OutlineButton title="💬 Chat" onPress={onChat}/><Pressable style={s.sosQuick} onPress={onSafety}><Text style={s.sosQuickText}>🛡 SOS</Text></Pressable><OutlineButton title="✕ Cancel" onPress={onCancel}/></View><StatusTimeline status="assigned"/><Card style={s.pinCard}><Text style={s.pinTitle}>🔒 Start Trip with PIN</Text><Text style={s.pinSub}>Ask the driver for the 4-digit PIN to start your trip.</Text><View style={s.pinBoxes}>{[0,1,2,3].map(i=><View key={i} style={s.pinBox}><Text style={s.pinDash}>—</Text></View>)}</View><Text style={s.blueInfo}>ℹ Check the vehicle and driver details before starting.</Text></Card></Card></>;
 }
 function TripInProgressState({goods,driverLocation,driverId,pickup,drop,pickupLat,pickupLng,dropLat,dropLng,currentLocation,locationLoading,onCurrentLocationPress,onChat,onCancel,onCall,onSafety}:{goods:boolean;driverLocation:{latitude:number;longitude:number;recordedAt?:string}|null;driverId?:string;pickup:string;drop:string;pickupLat:number;pickupLng:number;dropLat:number;dropLng:number;currentLocation?:{latitude:number;longitude:number;accuracy?:number|null;recordedAt?:string}|null;locationLoading:boolean;onCurrentLocationPress?:()=>void;onChat:()=>void;onCancel:()=>void;onCall:()=>void;onSafety:()=>void}) {
   const distance = Math.max(0, Math.hypot(dropLat-pickupLat,dropLng-pickupLng)*111);
-  return <><View style={s.startedBanner}><View style={s.stateIcon}><Text>✓</Text></View><View style={{flex:1}}><Text style={s.stateTitle}>Trip Started!</Text><Text style={s.stateSub}>Your {goods?"goods":"driver"} are on the way to the destination.</Text></View><View style={s.etaBox}><Text style={s.etaBig}>8 min</Text><Text style={s.etaSmall}>({distance.toFixed(1)} km away)</Text></View></View><FakeMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup||"Pickup"} dropLabel={drop||"Patna Junction"} inProgress driver goods={goods} driverLocation={driverLocation} currentLocation={currentLocation} locationLoading={locationLoading} onCurrentLocationPress={onCurrentLocationPress}/><Card><DriverSummary driverId={driverId||"test-passenger"} goods={goods}/><View style={s.driverActions}><Pressable style={s.callBtn} onPress={onCall}><Text style={s.callBtnText}>Call</Text></Pressable><OutlineButton title="💬 Chat" onPress={onChat}/><Pressable style={s.sosQuick} onPress={onSafety}><Text style={s.sosQuickText}>🛡 SOS</Text></Pressable><OutlineButton title="✕ Cancel" onPress={onCancel}/></View><StatusTimeline status="started"/><View style={s.verifyCard}><Text style={s.pinTitle}>🔐 Verify Driver & Start Trip</Text><Text style={s.pinSub}>PIN verified • Trip in progress</Text><View style={s.pinBoxes}>{[1,2,3,4].map(n=><View key={n} style={s.pinBox}><Text style={s.pinNumber}>{n}</Text></View>)}</View><Text style={s.greenText}>✓ PIN verified</Text></View></Card></>;
+  return <><View style={s.startedBanner}><View style={s.stateIcon}><Text>✓</Text></View><View style={{flex:1}}><Text style={s.stateTitle}>Trip Started!</Text><Text style={s.stateSub}>Your {goods?"goods":"driver"} are on the way to the destination.</Text></View><View style={s.etaBox}><Text style={s.etaBig}>8 min</Text><Text style={s.etaSmall}>({distance.toFixed(1)} km away)</Text></View></View><RideXMap pickupLat={pickupLat} pickupLng={pickupLng} dropLat={dropLat} dropLng={dropLng} pickupLabel={pickup||"Pickup"} dropLabel={drop || "Destination"} inProgress driver goods={goods} driverLocation={driverLocation} currentLocation={currentLocation} locationLoading={locationLoading} onCurrentLocationPress={onCurrentLocationPress}/><Card><DriverSummary driverId={driverId||"test-passenger"} goods={goods}/><View style={s.driverActions}><Pressable style={s.callBtn} onPress={onCall}><Text style={s.callBtnText}>Call</Text></Pressable><OutlineButton title="💬 Chat" onPress={onChat}/><Pressable style={s.sosQuick} onPress={onSafety}><Text style={s.sosQuickText}>🛡 SOS</Text></Pressable><OutlineButton title="✕ Cancel" onPress={onCancel}/></View><StatusTimeline status="started"/><View style={s.verifyCard}><Text style={s.pinTitle}>🔐 Verify Driver & Start Trip</Text><Text style={s.pinSub}>PIN verified • Trip in progress</Text><View style={s.pinBoxes}>{[1,2,3,4].map(n=><View key={n} style={s.pinBox}><Text style={s.pinNumber}>{n}</Text></View>)}</View><Text style={s.greenText}>✓ PIN verified</Text></View></Card></>;
 }
 function StatusTimeline({status}:{status:"assigned"|"started"}) {
   const labels=status==="assigned"?["Driver Assigned","On the way","Arrived","Trip Started","Trip Completed"]:["Driver Assigned","Picked Up","In Transit","Arriving Soon","Delivered"];
@@ -3103,7 +3249,7 @@ function VehicleIllustration({kind,large=false,compact=false,hero=false}:{kind:"
     </View>
   );
 }
-function FakeMap({
+function RideXMap({
   pickupLabel,
   dropLabel,
   showVehicles = false,
@@ -3114,13 +3260,14 @@ function FakeMap({
   searching = false,
   goods = false,
   compact = false,
-  pickupLat: pickupLatitude = 25.5392,
-  pickupLng: pickupLongitude = 87.5717,
-  dropLat: dropLatitude = 25.5941,
-  dropLng: dropLongitude = 85.1376,
+  pickupLat: pickupLatitude,
+  pickupLng: pickupLongitude,
+  dropLat: dropLatitude,
+  dropLng: dropLongitude,
   driverLocation = null,
   currentLocation = null,
   onCurrentLocationPress,
+  onMapPress,
   locationLoading = false,
 }: {
   pickupLabel: string;
@@ -3140,52 +3287,117 @@ function FakeMap({
   driverLocation?: { latitude: number; longitude: number; recordedAt?: string } | null;
   currentLocation?: { latitude: number; longitude: number; accuracy?: number | null; recordedAt?: string } | null;
   onCurrentLocationPress?: () => void;
+  onMapPress?: (coordinate: { latitude: number; longitude: number }) => void;
   locationLoading?: boolean;
 }) {
-  const [mapRef] = useState(() => React.createRef<MapView>());
-  const [mapType, setMapType] = useState<MapType>("standard");
-  const [layersOpen, setLayersOpen] = useState(false);
-  const pickup = {
-    latitude: Number.isFinite(Number(pickupLatitude)) ? Number(pickupLatitude) : 25.5392,
-    longitude: Number.isFinite(Number(pickupLongitude)) ? Number(pickupLongitude) : 87.5717,
+  const mapRef = useRef<MapView | null>(null);
+
+  const pickupCandidate = {
+    latitude: Number(pickupLatitude),
+    longitude: Number(pickupLongitude),
   };
-  const drop = {
-    latitude: Number.isFinite(Number(dropLatitude)) ? Number(dropLatitude) : 25.5941,
-    longitude: Number.isFinite(Number(dropLongitude)) ? Number(dropLongitude) : 85.1376,
+  const dropCandidate = {
+    latitude: Number(dropLatitude),
+    longitude: Number(dropLongitude),
   };
 
-  const center = {
-    latitude: (pickup.latitude + drop.latitude) / 2,
-    longitude: (pickup.longitude + drop.longitude) / 2,
-  };
-  const latitudeDelta = Math.max(0.025, Math.abs(pickup.latitude - drop.latitude) * 1.8 + 0.018);
-  const longitudeDelta = Math.max(0.025, Math.abs(pickup.longitude - drop.longitude) * 1.8 + 0.018);
+  // These coordinates belonged to the old demo/fake-map implementation.
+  // They are intentionally never rendered as user/booking locations.
+  const isDemoCoordinate = (latitude: number, longitude: number) =>
+    [
+      [25.5392, 87.5717],
+      [25.5480, 87.5790],
+      [25.5941, 85.1376],
+    ].some(
+      ([demoLat, demoLng]) =>
+        Math.abs(latitude - demoLat) < 0.000001 &&
+        Math.abs(longitude - demoLng) < 0.000001,
+    );
 
-  const vehicleOffsets = [
-    [0.004, 0.004],
-    [-0.003, 0.002],
-    [0.002, -0.004],
-    [-0.004, -0.003],
-    [0.005, -0.001],
-  ];
+  const hasRealPickup =
+    Number.isFinite(pickupCandidate.latitude) &&
+    Number.isFinite(pickupCandidate.longitude) &&
+    !isDemoCoordinate(pickupCandidate.latitude, pickupCandidate.longitude);
 
-  const route = [
-    pickup,
-    {
-      latitude: pickup.latitude + (drop.latitude - pickup.latitude) * 0.32,
-      longitude: pickup.longitude + (drop.longitude - pickup.longitude) * 0.20,
-    },
-    {
-      latitude: pickup.latitude + (drop.latitude - pickup.latitude) * 0.63,
-      longitude: pickup.longitude + (drop.longitude - pickup.longitude) * 0.76,
-    },
-    drop,
-  ];
+  const hasRealDrop =
+    Number.isFinite(dropCandidate.latitude) &&
+    Number.isFinite(dropCandidate.longitude) &&
+    !isDemoCoordinate(dropCandidate.latitude, dropCandidate.longitude);
 
-  const markerImage = goods ? CUSTOMER_ASSETS.pickupTruck : CUSTOMER_ASSETS.eRickshaw;
+  const pickup = hasRealPickup ? pickupCandidate : null;
+  const drop = hasRealDrop ? dropCandidate : null;
+
+  const center = currentLocation
+    ? {
+        latitude: currentLocation.latitude,
+        longitude: currentLocation.longitude,
+      }
+    : pickup
+      ? pickup
+      : drop
+        ? drop
+        : {
+            latitude: 20.5937,
+            longitude: 78.9629,
+          };
+
+  const points = [pickup, drop].filter(
+    (point): point is { latitude: number; longitude: number } => Boolean(point),
+  );
+
+  const singlePointDelta = compact ? 0.025 : 0.035;
+  const latitudeDelta =
+    points.length >= 2
+      ? Math.max(0.02, Math.abs(points[0].latitude - points[1].latitude) * 1.8 + 0.018)
+      : singlePointDelta;
+  const longitudeDelta =
+    points.length >= 2
+      ? Math.max(0.02, Math.abs(points[0].longitude - points[1].longitude) * 1.8 + 0.018)
+      : singlePointDelta;
+
+  useEffect(() => {
+    if (!mapRef.current) return;
+
+    if (currentLocation) {
+      mapRef.current.animateToRegion(
+        {
+          latitude: currentLocation.latitude,
+          longitude: currentLocation.longitude,
+          latitudeDelta: compact ? 0.02 : 0.03,
+          longitudeDelta: compact ? 0.02 : 0.03,
+        },
+        450,
+      );
+      return;
+    }
+
+    if (points.length >= 2) {
+      mapRef.current.fitToCoordinates(points, {
+        edgePadding: { top: 90, right: 70, bottom: 90, left: 70 },
+        animated: true,
+      });
+    } else if (pickup || drop) {
+      mapRef.current.animateToRegion(
+        {
+          ...center,
+          latitudeDelta,
+          longitudeDelta,
+        },
+        450,
+      );
+    }
+  }, [
+    currentLocation?.latitude,
+    currentLocation?.longitude,
+    pickup?.latitude,
+    pickup?.longitude,
+    drop?.latitude,
+    drop?.longitude,
+    compact,
+  ]);
 
   return (
-    <View style={[s.fakeMap, compact && s.fakeMapCompact]}>
+    <View style={[s.rideMapCard, compact && s.rideMapCardCompact]}>
       <MapView
         ref={mapRef}
         provider={PROVIDER_GOOGLE}
@@ -3195,10 +3407,12 @@ function FakeMap({
           latitudeDelta,
           longitudeDelta,
         }}
-        mapType={mapType}
+        mapType="standard"
         showsCompass={false}
         showsScale={false}
         showsTraffic={false}
+        showsBuildings={false}
+        showsPointsOfInterests={false}
         toolbarEnabled={false}
         showsUserLocation={Boolean(currentLocation)}
         showsMyLocationButton={false}
@@ -3206,150 +3420,93 @@ function FakeMap({
         zoomEnabled
         rotateEnabled
         scrollEnabled
+        pitchEnabled
+        moveOnMarkerPress
+        onPress={onMapPress ? (event) => onMapPress(event.nativeEvent.coordinate) : undefined}
       >
-        <Polyline
-          coordinates={route}
-          strokeColor={completed ? COLORS.green : COLORS.red}
-          strokeWidth={5}
-          lineCap="round"
-          lineJoin="round"
-        />
-
-        <Marker coordinate={pickup} title={pickupLabel} description="Pickup location" pinColor="#F31B2D" />
-
-        {currentLocation ? (
+        {pickup ? (
           <Marker
-            coordinate={{
-              latitude: currentLocation.latitude,
-              longitude: currentLocation.longitude,
-            }}
-            title="You are here"
-            description="Current device location"
-            anchor={{ x: 0.5, y: 0.5 }}
-            tracksViewChanges={false}
-          >
-            <View style={s.googleCurrentLocationMarker}>
-              <View style={s.googleCurrentLocationDot} />
-            </View>
-          </Marker>
+            coordinate={pickup}
+            title={pickupLabel || "Pickup location"}
+            description="RideX pickup location"
+            pinColor="#F31B2D"
+          />
         ) : null}
-        <Marker coordinate={drop} title={dropLabel} description="Destination" pinColor={completed ? "#18A957" : "#F31B2D"} />
 
-        {showVehicles && vehicleOffsets.map(([dLat, dLng], index) => (
+        {drop ? (
           <Marker
-            key={`vehicle-${index}`}
+            coordinate={drop}
+            title={dropLabel || "Destination"}
+            description="RideX destination"
+            pinColor={completed ? "#18A957" : "#F31B2D"}
+          />
+        ) : null}
+
+        {driver && driverLocation ? (
+          <Marker
             coordinate={{
-              latitude: pickup.latitude + dLat,
-              longitude: pickup.longitude + dLng,
+              latitude: driverLocation.latitude,
+              longitude: driverLocation.longitude,
             }}
-            anchor={{ x: 0.5, y: 0.5 }}
-            tracksViewChanges={false}
-          >
-            <Image source={markerImage} style={s.googleMapVehicleMarker} resizeMode="contain" />
-          </Marker>
-        ))}
-
-        {driver && (
-          <Marker
-            coordinate={
-              driverLocation
-                ? {
-                    latitude: driverLocation.latitude,
-                    longitude: driverLocation.longitude,
-                  }
-                : {
-                    latitude: pickup.latitude + 0.006,
-                    longitude: pickup.longitude + 0.004,
-                  }
-            }
             anchor={{ x: 0.5, y: 0.5 }}
             tracksViewChanges={false}
             title="RideX Driver"
-            description="Driver is on the way"
+            description={inProgress ? "Driver location" : "Driver is on the way"}
           >
             <View style={s.googleDriverMarkerWrap}>
               <View style={s.googleDriverPulse} />
-              <Image source={markerImage} style={s.googleDriverMarker} resizeMode="contain" />
+              <Image
+                source={goods ? CUSTOMER_ASSETS.pickupTruck : CUSTOMER_ASSETS.eRickshaw}
+                style={s.googleDriverMarker}
+                resizeMode="contain"
+              />
             </View>
           </Marker>
-        )}
-
-
+        ) : null}
       </MapView>
 
-      <View pointerEvents="none" style={s.googleMapTopShade} />
-
-      {searching && (
+      {searching ? (
         <View style={s.searchBubble}>
           <Text style={s.mapBubbleTitle}>Looking for nearby drivers...</Text>
           <Text style={s.muted}>RideX is matching your booking</Text>
         </View>
-      )}
+      ) : null}
 
-      <View style={s.mapLabelPickup} pointerEvents="none">
-        <Text style={s.mapLabelTitle}>{pickupLabel}</Text>
-      </View>
-      <View style={s.mapLabelDrop} pointerEvents="none">
-        <Text style={s.mapLabelTitle}>{dropLabel}</Text>
-      </View>
+      {onCurrentLocationPress ? (
+        <View style={s.mapControlCol}>
+          <Pressable
+            style={[s.mapControl, locationLoading && s.mapControlDisabled]}
+            onPress={onCurrentLocationPress}
+            disabled={locationLoading}
+            accessibilityRole="button"
+            accessibilityLabel="Use current location"
+          >
+            <AssetIcon name={locationLoading ? "clock" : "recenter"} size={20} />
+          </Pressable>
 
-              <View style={s.mapControlCol}>
-         <Pressable
-           style={[s.mapControl, locationLoading && s.mapControlDisabled]}
-           onPress={onCurrentLocationPress}
-           disabled={!onCurrentLocationPress || locationLoading}
-         >
-           <AssetIcon name={locationLoading ? "clock" : "recenter"} size={20} />
-         </Pressable>
-         <Pressable
-           style={[s.mapControl, layersOpen && s.mapControlActive]}
-           onPress={() => setLayersOpen((open) => !open)}
-           accessibilityRole="button"
-           accessibilityLabel="Map layers"
-         >
-           <AssetIcon name="layers" size={20} />
-         </Pressable>
-         {layersOpen && (
-           <View style={s.mapLayerMenu}>
-             {([
-               ["standard", "Standard"],
-               ["satellite", "Satellite"],
-               ["hybrid", "Hybrid"],
-             ] as Array<[MapType, string]>).map(([type, label]) => (
-               <Pressable
-                 key={type}
-                 style={[s.mapLayerOption, mapType === type && s.mapLayerOptionActive]}
-                 onPress={() => {
-                   setMapType(type);
-                   setLayersOpen(false);
-                 }}
-               >
-                 <Text style={s.mapLayerOptionText}>{label}</Text>
-               </Pressable>
-             ))}
-           </View>
-         )}
-       </View>
+        </View>
+      ) : null}
 
-      {arrived && (
+      {arrived ? (
         <View style={s.mapBubble}>
           <Text style={s.mapBubbleTitle}>Your driver has arrived</Text>
           <Text style={s.muted}>at the pickup location</Text>
         </View>
-      )}
-      {completed && (
+      ) : null}
+      {completed ? (
         <View style={s.mapBubbleGreen}>
           <Text style={s.mapBubbleTitle}>Trip completed successfully</Text>
         </View>
-      )}
-      {inProgress && (
+      ) : null}
+      {inProgress ? (
         <View style={s.mapBubbleBlue}>
           <Text style={s.mapBubbleTitle}>On the way to destination</Text>
         </View>
-      )}
+      ) : null}
     </View>
   );
 }
+
 function getStatusTheme(status:string,mode:BookingMode){return status==="COMPLETED"?COLORS.green:mode==="GOODS"?COLORS.red:COLORS.red;}
 function farePreviewForStatus(){return 80;}
 function previewStatusDistance(){return 2.8;}
@@ -3461,8 +3618,8 @@ const s = StyleSheet.create({
   routeTitle:{fontSize:12,color:COLORS.muted},
   routeValue:{fontSize:14,fontWeight:"700",marginTop:1},
   cardTitle:{fontSize:16,fontWeight:"900",color:COLORS.black},
-  fakeMap:{height:230,borderRadius:18,overflow:"hidden",backgroundColor:"#EDF3EA",position:"relative"},
-  fakeMapCompact:{height:190},
+  rideMapCard:{height:230,borderRadius:18,overflow:"hidden",backgroundColor:"#EDF3EA",position:"relative"},
+  rideMapCardCompact:{height:190},
   mapWater:{position:"absolute",top:0,right:-60,width:190,height:"100%",backgroundColor:"#BDE0F4",transform:[{rotate:"8deg"}]},
   mapStreet:{position:"absolute",left:-20,right:-20,height:4,backgroundColor:"#E8C86B",opacity:.75},
   mapStreetHorizontal:{position:"absolute",top:42,bottom:-20,width:3,backgroundColor:"#fff",opacity:.85,transform:[{rotate:"15deg"}]},
@@ -3574,6 +3731,12 @@ const s = StyleSheet.create({
   goodsOption:{borderWidth:1,borderColor:COLORS.line,borderRadius:19,padding:11,flexDirection:"row",alignItems:"center",gap:10,marginBottom:8,backgroundColor:"#fff"},
   goodsOptionSelected:{borderColor:COLORS.red,backgroundColor:"#FFF8F8"},
   goodsIcon:{width:78,height:62,borderRadius:14,backgroundColor:"#F6F7F9",alignItems:"center",justifyContent:"center"},
+  scheduleDateTimeRow:{flexDirection:"row",gap:8,width:"100%"},
+  scheduleDateInput:{borderWidth:1,borderColor:COLORS.line,borderRadius:13,paddingHorizontal:12,paddingVertical:11,flex:1,minWidth:0,height:52},
+  scheduleTimeInput:{borderWidth:1,borderColor:COLORS.line,borderRadius:13,paddingHorizontal:12,paddingVertical:11,flex:1,minWidth:0,height:52},
+  schedulePeriodRow:{flexDirection:"row",gap:8,width:"100%"},
+  schedulePeriodButton:{borderWidth:1,borderColor:COLORS.line,borderRadius:13,minHeight:50,flex:1,alignItems:"center",justifyContent:"center"},
+  schedulePeriodText:{fontWeight:"800"},
   scheduleGrid:{flexDirection:"row",gap:7,flexWrap:"wrap",marginTop:8},
   scheduleInput:{borderWidth:1,borderColor:COLORS.line,borderRadius:13,padding:10,flex:1,minWidth:120},
   centerPill:{alignItems:"center",justifyContent:"center",minWidth:70},
