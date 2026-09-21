@@ -4,10 +4,12 @@ import * as Location from "expo-location";
 import * as DocumentPicker from "expo-document-picker";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { createRideXFetch, getRideXApiUrl } from "../shared/api/client";
-import { registerRideXPushToken } from "../pushNotifications";
+import { registerRideXPushToken, subscribeRideXNotificationHandlers, unregisterRideXPushTokenListener } from "../pushNotifications";
 import QRCode from "react-native-qrcode-svg";
 import MapView, { Marker, Polyline } from "react-native-maps";
 import { DRIVER_ASSETS } from "../shared/assets";
+import { openRideXEventStream, type RideXStreamEvent } from "../shared/realtime/client";
+import RideXMotionSurface, { computeCoordinateDriftScore } from "../shared/ui/RideXMotionSurface";
 
 import {
   KeyboardAvoidingView,
@@ -47,6 +49,9 @@ const DEFAULT_DRIVER_ID = process.env.EXPO_PUBLIC_DRIVER_ID || "";
 const DRIVER_AUTH_TOKEN_KEY = "ridex_driver_auth_token_v1";
 const DRIVER_SESSION_KEY = "ridex_driver_session_v1";
 const RIDEX_TEST_MODE = String(process.env.EXPO_PUBLIC_RIDEX_TEST_MODE ?? "false").toLowerCase() === "true";
+const RIDEX_SUPPORT_PHONE = String(process.env.EXPO_PUBLIC_RIDEX_SUPPORT_PHONE ?? "").trim();
+
+type DriverServiceMode = "PASSENGER" | "GOODS" | "BOTH";
 
 const ridexFetch = createRideXFetch({ tokenKey: DRIVER_AUTH_TOKEN_KEY, apiUrl: API });
 
@@ -60,11 +65,6 @@ const RIDEX_OPTIONAL_CONFIG = {
   routingUrl: process.env.EXPO_PUBLIC_ROUTING_URL || "",
   notificationsUrl: process.env.EXPO_PUBLIC_NOTIFICATIONS_URL || "",
 };
-
-type ServiceMode =
-  | "PASSENGER"
-  | "GOODS"
-  | "BOTH";
 
 type DriverRequest = {
   id: string;
@@ -116,17 +116,20 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
   const [online, setOnline] =
     useState(false);
 
+  useEffect(() => { onlineRef.current = online; }, [online]);
+
   // Keep the app resilient when an optional provider is not configured.
   void RIDEX_OPTIONAL_CONFIG;
-
-  const [serviceMode, setServiceMode] =
-    useState<ServiceMode>("BOTH");
 
   const [requests, setRequests] =
     useState<DriverRequest[]>([]);
 
   const [activeRide, setActiveRide] =
     useState<ActiveRide | null>(null);
+  const onlineRef = useRef(false);
+  const activeRideRef = useRef<ActiveRide | null>(null);
+  useEffect(() => { activeRideRef.current = activeRide; }, [activeRide]);
+  const [realtimeConnected, setRealtimeConnected] = useState(false);
 
   const [message, setMessage] =
     useState("Ready");
@@ -148,6 +151,18 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
 
   const [lastCompletion, setLastCompletion] =
     useState<Completion | null>(null);
+
+  const [lastCompletedContext, setLastCompletedContext] =
+    useState<{
+      customerName: string;
+      customerRating: string | null;
+      customerRideCount: string | null;
+      passengerCount: string | null;
+      pickup: string;
+      drop: string;
+      distanceKm: number | null;
+      durationMinutes: number | null;
+    } | null>(null);
 
   // =====================================================
   // REAL DEVICE GPS
@@ -327,6 +342,198 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
     } catch {}
   }
 
+  async function loadDriverHistory(id = driverId) {
+    if (!id) return;
+    try {
+      const response = await ridexFetch(`${API}/driver/${encodeURIComponent(id)}/history`);
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data.success) setHistoryRows(Array.isArray(data.data) ? data.data : []);
+    } catch {}
+  }
+
+  async function loadOnboardingStatus(id = driverId) {
+    if (!id) return;
+    try {
+      const response = await ridexFetch(`${API}/driver/${encodeURIComponent(id)}/onboarding-status`);
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data.success) setOnboardingStatus(data.data || null);
+    } catch {}
+  }
+
+  async function loadSupportCases(id = driverId) {
+    if (!id) return;
+    try {
+      const response = await ridexFetch(`${API}/support/cases?actorType=DRIVER&actorId=${encodeURIComponent(id)}`);
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data.success) {
+        const rows = Array.isArray(data.data) ? data.data : [];
+        setSupportCases(rows);
+        setSelectedSupportCaseId(current => current && rows.some((x: any) => x.id === current) ? current : rows[0]?.id ?? null);
+      }
+    } catch {}
+  }
+
+  async function requestRegistrationOtp() {
+    const clean = registrationMobile.replace(/\D/g, "").slice(-10);
+    if (!/^\d{10}$/.test(clean) || !registrationFullName.trim()) {
+      setAuthMessage("Enter your name and valid 10-digit mobile number");
+      return;
+    }
+    setAuthLoading(true);
+    setAuthMessage("");
+    try {
+      const response = await ridexFetch(`${API}/auth/send-otp`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mobile: clean, userType: "DRIVER" }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.success === false) { setAuthMessage(data.message || "Unable to send registration OTP"); return; }
+      setRegistrationOtpSent(true);
+      setAuthMessage(RIDEX_TEST_MODE && data.testOtp ? `TEST OTP: ${data.testOtp}` : "OTP sent successfully");
+    } catch { setAuthMessage("Unable to reach RideX service"); } finally { setAuthLoading(false); }
+  }
+
+  async function completeDriverRegistration() {
+    const clean = registrationMobile.replace(/\D/g, "").slice(-10);
+    if (!/^\d{10}$/.test(clean) || !/^\d{4}$/.test(registrationOtp.trim()) || !registrationFullName.trim()) {
+      setAuthMessage("Name, mobile and OTP are required");
+      return;
+    }
+    setAuthLoading(true);
+    setAuthMessage("");
+    try {
+      const response = await ridexFetch(`${API}/auth/driver/register/verify`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mobile: clean, otp: registrationOtp.trim(), fullName: registrationFullName.trim(), address: registrationAddress.trim() }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.success === false) { setAuthMessage(data.message || "Unable to complete driver registration"); return; }
+      const returnedDriverId = String(data.data?.driverId || "").trim();
+      const token = String(data.data?.token || "").trim();
+      if (!returnedDriverId || !token) { setAuthMessage("Registration completed but session was not returned"); return; }
+      setDriverId(returnedDriverId);
+      await AsyncStorage.setItem(DRIVER_SESSION_KEY, JSON.stringify({ driverId: returnedDriverId }));
+      await AsyncStorage.setItem(DRIVER_AUTH_TOKEN_KEY, token);
+      await loadDriver(returnedDriverId);
+      await loadOnboardingStatus(returnedDriverId);
+      void registerRideXPushToken({ api: API, authToken: token, appVersion: String(process.env.EXPO_PUBLIC_APP_VERSION ?? "") });
+      setRegistrationOtpSent(false);
+      setRegistrationOtp("");
+      setScreen("kyc");
+    } catch { setAuthMessage("Unable to reach RideX service"); } finally { setAuthLoading(false); }
+  }
+
+  async function createDocumentSlot(documentType: string) {
+    if (!driverId) return;
+    setActionLoading(`doc-create-${documentType}`);
+    try {
+      const response = await ridexFetch(`${API}/driver/${encodeURIComponent(driverId)}/documents`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ documentType }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) { setMessage(data.message || "Unable to create document slot"); return; }
+      setDriverDocuments(prev => prev.some((d: any) => d.id === data.data?.id) ? prev : [...prev, data.data]);
+      setMessage(`${documentType.replaceAll("_", " ")} slot is ready for upload.`);
+    } catch { setMessage("Unable to create document slot"); } finally { setActionLoading(null); }
+  }
+
+  async function createDriverVehicle() {
+    if (!driverId) return;
+    const capacity = Number(newVehicleCapacity);
+    if (!newVehicleNumber.trim() || !Number.isInteger(capacity) || capacity < 1) { setMessage("Vehicle number and valid capacity are required"); return; }
+    setActionLoading("vehicle-create");
+    try {
+      const response = await ridexFetch(`${API}/driver/${encodeURIComponent(driverId)}/vehicles`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ vehicleType: newVehicleType, vehicleNumber: newVehicleNumber.trim().toUpperCase(), capacity, goodsEligible: newVehicleGoodsEligible }) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) { setMessage(data.message || "Unable to add vehicle"); return; }
+      setDriverVehicles(prev => [...prev, data.data]);
+      setNewVehicleNumber("");
+      setMessage("Vehicle submitted for verification");
+    } catch { setMessage("Unable to add vehicle"); } finally { setActionLoading(null); }
+  }
+
+  async function submitDriverOnboarding() {
+    if (!driverId) return;
+    setActionLoading("onboarding-submit");
+    try {
+      const response = await ridexFetch(`${API}/driver/${encodeURIComponent(driverId)}/onboarding/submit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) { setMessage(data.message || "Unable to submit application"); return; }
+      await loadDriver(driverId);
+      await loadOnboardingStatus(driverId);
+      setMessage("Application submitted. RideX Admin will review your driver account.");
+      setScreen("onboardingStatus");
+    } catch { setMessage("Unable to submit driver application"); } finally { setActionLoading(null); }
+  }
+
+  async function sendSupportMessage() {
+    const caseId = selectedSupportCaseId;
+    const draft = supportDraft.trim();
+    if (!caseId || !draft || !driverId) return;
+    setActionLoading("support-message");
+    try {
+      const response = await ridexFetch(`${API}/support/cases/${encodeURIComponent(caseId)}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ actorType: "DRIVER", actorId: driverId, message: draft }) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) { setMessage(data.message || "Unable to send support message"); return; }
+      setSupportDraft("");
+      await loadSupportCases(driverId);
+    } catch { setMessage("Unable to send support message"); } finally { setActionLoading(null); }
+  }
+
+  async function sendSupportAttachment() {
+    const caseId = selectedSupportCaseId;
+    if (!caseId || !driverId) { setMessage("Select a support case first."); return; }
+    try {
+      setActionLoading("support-attachment");
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ["application/pdf", "image/jpeg", "image/png"],
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      if (result.canceled || !result.assets?.[0]?.uri) return;
+      const asset = result.assets[0];
+      const response = await fetch(asset.uri);
+      if (!response.ok) throw new Error("Unable to read selected file");
+      const blob = await response.blob();
+      const dataUrl: string = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error("Unable to read selected file"));
+        reader.readAsDataURL(blob);
+      });
+      const upload = await ridexFetch(`${API}/support/cases/${encodeURIComponent(caseId)}/messages/attachment`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          actorType: "DRIVER",
+          actorId: driverId,
+          message: supportDraft.trim() || `Attachment: ${asset.name || "file"}`,
+          fileName: asset.name || "support-file",
+          mimeType: asset.mimeType || blob.type || "application/octet-stream",
+          base64: dataUrl,
+        }),
+      });
+      const data = await upload.json().catch(() => ({}));
+      if (!upload.ok || !data.success) throw new Error(data.message || "Unable to upload attachment");
+      setSupportDraft("");
+      await loadSupportCases(driverId);
+      setMessage("Support attachment sent.");
+    } catch (error:any) {
+      setMessage(error?.message || "Unable to send support attachment");
+    } finally { setActionLoading(null); }
+  }
+
+  async function openSupportAttachment(messageId: string) {
+    if (!selectedSupportCaseId || !driverId || !messageId) return;
+    try {
+      const response = await ridexFetch(`${API}/support/cases/${encodeURIComponent(selectedSupportCaseId)}/messages/${encodeURIComponent(messageId)}/attachment-url?actorType=DRIVER&actorId=${encodeURIComponent(driverId)}`);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success || !data.data?.url) { setMessage(data.message || "Attachment is unavailable"); return; }
+      await Linking.openURL(String(data.data.url));
+    } catch { setMessage("Unable to open support attachment"); }
+  }
+
   async function saveVehicle(vehicleId: string) {
     setActionLoading("vehicle-save");
     try {
@@ -390,12 +597,100 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
     } catch { setMessage("Unable to save bank details"); } finally { setActionLoading(null); }
   }
 
+
+  async function updateDriverServiceMode(
+    mode: DriverServiceMode,
+    parcelEnabled = parcelServiceEnabled,
+  ) {
+    if (!driverId) {
+      setMessage("Driver profile is not available.");
+      return;
+    }
+
+    setServiceModeLoading(true);
+
+    try {
+      const response = await ridexFetch(
+        `${API}/driver/${encodeURIComponent(driverId)}/service-mode`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode,
+            parcelServiceEnabled: Boolean(parcelEnabled),
+          }),
+        },
+      );
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok || !data.success) {
+        setMessage(
+          data.message || "Unable to update working services",
+        );
+        return;
+      }
+
+      const updatedMode =
+        String(
+          data.data?.dailyServiceMode ??
+            mode,
+        ).toUpperCase();
+
+      const normalizedMode: DriverServiceMode =
+        updatedMode === "GOODS" ||
+        updatedMode === "BOTH"
+          ? (updatedMode as DriverServiceMode)
+          : "PASSENGER";
+
+      const updatedParcel =
+        Boolean(
+          data.data?.parcelServiceEnabled ??
+            parcelEnabled,
+        );
+
+      setServiceMode(normalizedMode);
+      setParcelServiceEnabled(updatedParcel);
+      setDriverProfile((current: any | null) =>
+        current
+          ? {
+              ...current,
+              dailyServiceMode: normalizedMode,
+              parcelServiceEnabled: updatedParcel,
+              serviceModeUpdatedAt:
+                data.data?.updatedAt ??
+                current.serviceModeUpdatedAt,
+            }
+          : current,
+      );
+
+      setMessage(
+        `Working services updated: ${
+          normalizedMode === "PASSENGER"
+            ? "Passenger"
+            : normalizedMode === "GOODS"
+              ? "Goods"
+              : "Passenger + Goods"
+        }${updatedParcel ? " • Parcel enabled" : ""}`,
+      );
+    } catch (error) {
+      console.error(
+        "DRIVER SERVICE MODE ERROR:",
+        error,
+      );
+      setMessage("Unable to reach RideX service.");
+    } finally {
+      setServiceModeLoading(false);
+    }
+  }
+
   // =====================================================
   // UI NAVIGATION / AUTH
   // =====================================================
 
-  const [screen, setScreen] = useState<DriverScreen>(startAt);
+  const [screen, setScreen] = useState<DriverScreen | "onboardingStatus">(startAt);
   const [mobile, setMobile] = useState("");
+  const [registrationMobile, setRegistrationMobile] = useState("");
   const [otp, setOtp] = useState("");
   const otpInputRef = useRef<TextInput | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
@@ -417,6 +712,30 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
   const [payoutUpi, setPayoutUpi] = useState("");
   const [onlineSince, setOnlineSince] = useState<number | null>(null);
   const [onlineClock, setOnlineClock] = useState(Date.now());
+
+  const [registrationFullName, setRegistrationFullName] = useState("");
+  const [registrationAddress, setRegistrationAddress] = useState("");
+  const [registrationOtp, setRegistrationOtp] = useState("");
+  const [registrationOtpSent, setRegistrationOtpSent] = useState(false);
+  const [historyRows, setHistoryRows] = useState<any[]>([]);
+  const [historyFilter, setHistoryFilter] = useState("ALL");
+  const [onboardingStatus, setOnboardingStatus] = useState<any | null>(null);
+  const [supportCases, setSupportCases] = useState<any[]>([]);
+  const [selectedSupportCaseId, setSelectedSupportCaseId] = useState<string | null>(null);
+  const [supportDraft, setSupportDraft] = useState("");
+  const [newVehicleType, setNewVehicleType] = useState("E_RICKSHAW");
+  const [newVehicleNumber, setNewVehicleNumber] = useState("");
+  const [newVehicleCapacity, setNewVehicleCapacity] = useState("4");
+  const [newVehicleGoodsEligible, setNewVehicleGoodsEligible] = useState(false);
+
+  const [serviceMode, setServiceMode] =
+    useState<DriverServiceMode>("PASSENGER");
+  const [parcelServiceEnabled, setParcelServiceEnabled] =
+    useState(false);
+  const [serviceModeModalVisible, setServiceModeModalVisible] =
+    useState(false);
+  const [serviceModeLoading, setServiceModeLoading] =
+    useState(false);
 
   async function loadDriverNotifications() {
     if (!driverId) return;
@@ -469,6 +788,29 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
     return () => clearInterval(interval);
   }, [driverId]);
 
+  useEffect(() => {
+    const unsubscribe = subscribeRideXNotificationHandlers({
+      onReceived: () => {
+        void loadDriverNotifications();
+      },
+      onResponse: (response) => {
+        const data = (response.notification.request.content.data || {}) as Record<string, unknown>;
+        const target = String(data.screen || data.targetScreen || "").trim();
+        const type = String(data.type || response.notification.request.content.title || "").toUpperCase();
+        if (data.bookingId) void recoverActiveRide(driverId);
+        if (["KYC", "VERIFICATION", "ACCOUNT"].some(token => type.includes(token))) setScreen("onboardingStatus");
+        else if (["PAYOUT", "EARNING", "PAYMENT"].some(token => type.includes(token))) setScreen("earnings");
+        else if (["SUPPORT", "MESSAGE"].some(token => type.includes(token))) setScreen("messages");
+        else if (type.includes("SOS")) setScreen("sos");
+        else if (target === "history") setScreen("history");
+        else if (target === "notifications" || type.includes("OFFER")) setScreen("notifications");
+        else if (target === "home" || data.bookingId) setScreen("home");
+        void loadDriverNotifications();
+      },
+    });
+    return unsubscribe;
+  }, [driverId]);
+
   const DRIVER_HERO = DRIVER_ASSETS.hero;
   const DRIVER_AVATAR = DRIVER_ASSETS.avatar;
   const DRIVER_VEHICLE = DRIVER_ASSETS.vehicle;
@@ -499,7 +841,18 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
   }
 
   async function callDriverSupport() {
-    try { await Linking.openURL("tel:+9118001234567"); } catch { setMessage("Unable to open support call."); }
+    if (!RIDEX_SUPPORT_PHONE) {
+      setMessage(
+        "Support phone is not configured for this environment.",
+      );
+      return;
+    }
+
+    try {
+      await Linking.openURL(`tel:${RIDEX_SUPPORT_PHONE}`);
+    } catch {
+      setMessage("Unable to open support call.");
+    }
   }
 
   async function triggerDriverSos() {
@@ -555,10 +908,105 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
       console.error("DRIVER SEND OTP ERROR:", error);
       setOtp("");
       setAuthMessage(
-        RIDEX_TEST_MODE
-          ? "Test backend is reachable only when OTP provider is configured. Use OTP 1234 after the backend accepts the request."
-          : "Unable to reach RideX service."
+        "Unable to reach RideX service."
       );
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+
+  async function resendLoginOtp() {
+    const clean = mobile.replace(/\D/g, "").slice(0, 10);
+
+    if (!/^\d{10}$/.test(clean)) {
+      setAuthMessage("Enter a valid 10-digit mobile number");
+      return;
+    }
+
+    setAuthLoading(true);
+    setAuthMessage("");
+
+    try {
+      const response = await ridexFetch(`${API}/auth/resend-otp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mobile: clean,
+          userType: "DRIVER",
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok || data.success === false) {
+        setAuthMessage(
+          data.message || "Unable to resend OTP",
+        );
+        return;
+      }
+
+      setOtp("");
+
+      if (RIDEX_TEST_MODE && data.testOtp) {
+        setAuthMessage(`TEST OTP: ${data.testOtp}`);
+      } else {
+        setAuthMessage("OTP resent successfully");
+      }
+    } catch (error) {
+      console.error(
+        "DRIVER RESEND OTP ERROR:",
+        error,
+      );
+      setAuthMessage("Unable to reach RideX service.");
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function resendRegistrationOtp() {
+    const clean = registrationMobile.replace(/\D/g, "").slice(-10);
+
+    if (!/^\d{10}$/.test(clean) || !registrationFullName.trim()) {
+      setAuthMessage("Enter your name and valid 10-digit mobile number");
+      return;
+    }
+
+    setAuthLoading(true);
+    setAuthMessage("");
+
+    try {
+      const response = await ridexFetch(`${API}/auth/resend-otp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mobile: clean,
+          userType: "DRIVER",
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok || data.success === false) {
+        setAuthMessage(
+          data.message || "Unable to resend registration OTP",
+        );
+        return;
+      }
+
+      setRegistrationOtp("");
+
+      if (RIDEX_TEST_MODE && data.testOtp) {
+        setAuthMessage(`TEST OTP: ${data.testOtp}`);
+      } else {
+        setAuthMessage("Registration OTP resent successfully");
+      }
+    } catch (error) {
+      console.error(
+        "DRIVER REGISTRATION RESEND OTP ERROR:",
+        error,
+      );
+      setAuthMessage("Unable to reach RideX service.");
     } finally {
       setAuthLoading(false);
     }
@@ -566,7 +1014,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
 
   async function verifyOtp() {
     const clean = mobile.replace(/\D/g, "").slice(0, 10);
-    if (otp.length < 4) {
+    if (!/^\d{4}$/.test(otp)) {
       setAuthMessage("Enter the OTP");
       return;
     }
@@ -593,7 +1041,8 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
       await AsyncStorage.setItem(DRIVER_SESSION_KEY, JSON.stringify({ driverId: returnedDriverId }));
       if (token) await AsyncStorage.setItem(DRIVER_AUTH_TOKEN_KEY, token);
       await loadDriver(returnedDriverId);
-      setScreen("home");
+      const verificationStatus = String(data.data?.driverVerificationStatus ?? onboardingStatus?.verificationStatus ?? "PENDING").toUpperCase();
+      setScreen(verificationStatus === "APPROVED" ? "home" : "onboardingStatus");
     } catch (error) {
       console.error("DRIVER VERIFY ERROR:", error);
       setAuthMessage("Unable to reach RideX service.");
@@ -609,10 +1058,119 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         const stored = await AsyncStorage.getItem(DRIVER_SESSION_KEY);
         const parsed = stored ? JSON.parse(stored) : null;
         const id = String(parsed?.driverId || "").trim();
-        if (id) { setDriverId(id); await loadDriver(id); }
+        if (id) {
+          setDriverId(id);
+          await loadDriver(id);
+          const latest = await (async () => {
+            try {
+              const response = await ridexFetch(`${API}/driver/${encodeURIComponent(id)}/onboarding-status`);
+              const data = await response.json().catch(() => ({}));
+              return response.ok && data?.success ? (data.data ?? null) : null;
+            } catch { return null; }
+          })();
+          const recovered = await recoverActiveRide(id);
+          if (!recovered && latest) setScreen(String(latest.status || "").toUpperCase() === "APPROVED" ? "home" : "onboardingStatus");
+        }
       } catch (error) { console.error("DRIVER SESSION RESTORE ERROR:", error); }
     })();
   }, []);
+
+  useEffect(() => {
+    if (!driverId) return;
+    let stopped = false;
+    let closeStream: (() => void) | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let retryDelay = 1500;
+
+    const scheduleReconnect = () => {
+      if (stopped || retryTimer) return;
+      setRealtimeConnected(false);
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        retryDelay = Math.min(30000, retryDelay * 2);
+        void connect();
+      }, retryDelay);
+    };
+
+    const connect = async () => {
+      if (stopped) return;
+      const token = await AsyncStorage.getItem(DRIVER_AUTH_TOKEN_KEY);
+      if (!token || stopped) {
+        setRealtimeConnected(false);
+        return;
+      }
+      closeStream = openRideXEventStream({
+        url: `${API}/realtime/stream?actorType=DRIVER&actorId=${encodeURIComponent(driverId)}`,
+        headers: { Authorization: `Bearer ${token}` },
+        heartbeatTimeoutMs: 60000,
+        onOpen: () => {
+          retryDelay = 1500;
+          setRealtimeConnected(true);
+          if (onlineRef.current && !activeRideRef.current) void refreshRequests();
+          if (activeRideRef.current) void refreshActiveRide();
+        },
+        onClose: () => {
+          setRealtimeConnected(false);
+          scheduleReconnect();
+        },
+        onEvent: (event: RideXStreamEvent) => {
+          const currentActiveRide = activeRideRef.current;
+          switch (String(event.type || "").toUpperCase()) {
+            case "REQUEST_CREATED":
+              if (onlineRef.current && !currentActiveRide) void refreshRequests();
+              break;
+            case "REQUEST_ACCEPTED":
+            case "DRIVER_ARRIVED":
+            case "TRIP_STARTED":
+            case "TRIP_COMPLETED":
+              if (currentActiveRide && event.bookingId === currentActiveRide.request.bookingId) void refreshActiveRide();
+              else if (event.type === "REQUEST_ACCEPTED" && event.actorId === driverId) void refreshActiveRide();
+              void loadDriverEarnings(driverId);
+              void loadDriverHistory(driverId);
+              void loadDriverNotifications();
+              break;
+            case "DRIVER_ONLINE":
+            case "DRIVER_OFFLINE":
+              void loadOnboardingStatus(driverId);
+              break;
+            case "GPS_UPDATED":
+            case "TRIP_PROGRESS":
+              if (currentActiveRide && event.bookingId === currentActiveRide.request.bookingId) void refreshActiveRide();
+              break;
+            case "DRIVER_KYC_UPDATED":
+            case "DRIVER_VERIFICATION_UPDATED":
+            case "DRIVER_ONBOARDING_SUBMITTED":
+            case "DRIVER_VEHICLE_UPDATED":
+              void loadDriver(driverId);
+              void loadOnboardingStatus(driverId);
+              break;
+            case "SUPPORT_MESSAGE_CREATED":
+              void loadSupportCases(driverId);
+              break;
+            case "NOTIFICATION_CREATED":
+            case "SOS_TRIGGERED":
+              void loadDriverNotifications();
+              break;
+            default:
+              break;
+          }
+        },
+        onError: () => {
+          closeStream?.();
+          scheduleReconnect();
+        },
+      });
+    };
+
+    void connect();
+
+    return () => {
+      stopped = true;
+      setRealtimeConnected(false);
+      closeStream?.();
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+  }, [driverId]);
 
   useEffect(() => {
     if (incomingRequest) setScreen("request");
@@ -637,6 +1195,8 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
   // =====================================================
 
   async function loadDriver(id = driverId) {
+    if (!id) return;
+
     try {
       const response =
         await ridexFetch(
@@ -644,7 +1204,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       if (
         !response.ok ||
@@ -662,17 +1222,34 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
       setDriverProfile(driver || null);
       setDriverVehicles(Array.isArray(driver?.vehicles) ? driver.vehicles : []);
       setDriverDocuments(Array.isArray(driver?.documents) ? driver.documents : []);
+
+      const loadedServiceMode =
+        String(driver?.dailyServiceMode || "PASSENGER").toUpperCase();
+
+      if (
+        loadedServiceMode === "PASSENGER" ||
+        loadedServiceMode === "GOODS" ||
+        loadedServiceMode === "BOTH"
+      ) {
+        setServiceMode(
+          loadedServiceMode as DriverServiceMode,
+        );
+      }
+
+      setParcelServiceEnabled(
+        Boolean(driver?.parcelServiceEnabled),
+      );
       void loadPayoutProfile(id);
       void loadDriverEarnings(id);
+      void loadDriverHistory(id);
+      void loadOnboardingStatus(id);
+      void loadSupportCases(id);
+      void recoverActiveRide(id);
 
       const loadedOnline = driver?.driverStatus === "ONLINE";
       setOnline(loadedOnline);
       setOnlineSince(loadedOnline ? Date.now() : null);
 
-      setServiceMode(
-        driver?.dailyServiceMode ||
-          "BOTH"
-      );
     } catch (error) {
       console.error(
         "LOAD DRIVER ERROR:",
@@ -704,7 +1281,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       setLastRequestCheck(
         new Date().toISOString()
@@ -893,6 +1470,60 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
     );
   }
 
+  async function recoverActiveRide(id = driverId) {
+    if (!id) return false;
+    try {
+      const response = await ridexFetch(`${API}/driver/${encodeURIComponent(id)}/active-booking`);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) return false;
+
+      const booking = data.data;
+      if (!booking?.id) return false;
+
+      const legs = Array.isArray(booking.legs) ? booking.legs : [];
+      const currentLeg = legs.find((leg: any) =>
+        leg?.driverId === id &&
+        !["COMPLETED", "CANCELLED"].includes(String(leg?.status || "").toUpperCase())
+      ) || (booking.assignedDriverId === id ? legs.find((leg: any) => !["COMPLETED", "CANCELLED"].includes(String(leg?.status || "").toUpperCase())) : null);
+
+      const requestRow = Array.isArray(booking.rideRequests)
+        ? booking.rideRequests.find((row: any) =>
+            row?.driverId === id &&
+            (!currentLeg?.id || row?.legId === currentLeg.id) &&
+            ["OFFERED", "ACCEPTED"].includes(String(row?.status || "").toUpperCase())
+          )
+        : null;
+
+      const recoveredRequest: DriverRequest = {
+        id: requestRow?.id || `recovered-${booking.id}`,
+        bookingId: booking.id,
+        driverId: id,
+        vehicleId: currentLeg?.vehicleId || booking.vehicleId || "",
+        legId: currentLeg?.id || null,
+        status: requestRow?.status || "ACCEPTED",
+        distanceKm: requestRow?.distanceKm ?? null,
+        etaMinutes: requestRow?.etaMinutes ?? null,
+        score: requestRow?.score ?? null,
+        booking,
+        vehicle: currentLeg?.vehicle || booking.vehicle || null,
+        leg: currentLeg || null,
+      };
+
+      setActiveRide({ request: recoveredRequest, booking });
+      setTripPin(String(currentLeg?.tripPin || ""));
+      setRequests([]);
+      setIncomingRequest(null);
+
+      const status = String(booking.status || "").toUpperCase();
+      if (status === "DRIVER_ARRIVED") setScreen("arrived");
+      else if (status === "STARTED" || status === "IN_PROGRESS") setScreen("trip");
+      else setScreen("accepted");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // =====================================================
   // REFRESH ACTIVE RIDE
   // =====================================================
@@ -909,7 +1540,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       if (
         !response.ok ||
@@ -969,6 +1600,11 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
 
         setLastCompletion(
           completion
+        );
+
+        captureCompletedContext(
+          booking,
+          completion,
         );
 
         setMessage(
@@ -1228,7 +1864,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       if (
         !response.ok ||
@@ -1321,67 +1957,6 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
   }
 
   // =====================================================
-  // SERVICE MODE
-  // =====================================================
-
-  async function changeServiceMode(
-    mode: ServiceMode
-  ) {
-    try {
-      setLoading(true);
-
-      const response =
-        await ridexFetch(
-          `${API}/driver/${driverId}/service-mode`,
-          {
-            method: "POST",
-
-            headers: {
-              "Content-Type":
-                "application/json",
-            },
-
-            body: JSON.stringify({
-              mode,
-            }),
-          }
-        );
-
-      const data =
-        await response.json();
-
-      if (
-        !response.ok ||
-        !data.success
-      ) {
-        setMessage(
-          data.message ||
-            "Unable to update service mode"
-        );
-
-        return;
-      }
-
-      setServiceMode(mode);
-
-      setMessage(
-        `Today's service: ${mode}`
-      );
-    } catch (error) {
-      console.error(
-        "SERVICE MODE ERROR:",
-        error
-      );
-
-      setMessage(
-        "Backend not reachable"
-      );
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // =====================================================
   // ONLINE / OFFLINE
   // =====================================================
 
@@ -1438,7 +2013,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       if (
         !response.ok ||
@@ -1533,7 +2108,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       if (
         !response.ok ||
@@ -1659,7 +2234,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       if (
         !response.ok ||
@@ -1720,7 +2295,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       if (
         !response.ok ||
@@ -1779,6 +2354,80 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
     }
   }
 
+
+  function captureCompletedContext(
+    completedBooking: any,
+    completion: Completion,
+  ) {
+    const customerRatingValue = Number(
+      completedBooking?.customer?.rating ??
+        completedBooking?.customerRating,
+    );
+
+    const customerRideCountValue = Number(
+      completedBooking?.customer?.totalRides ??
+        completedBooking?.customer?.ridesCount ??
+        completedBooking?.customer?.rideCount,
+    );
+
+    const passengerCountValue = Number(
+      completedBooking?.passengerCount ??
+        completedBooking?.requestedPassengerCount ??
+        completedBooking?.passengers,
+    );
+
+    const distanceValue = Number(
+      completion.actualDistanceKm ??
+        completedBooking?.actualDistanceKm ??
+        completedBooking?.distanceKm,
+    );
+
+    const durationValue = Number(
+      completion.actualDurationMinutes ??
+        completedBooking?.actualDurationMinutes ??
+        completedBooking?.durationMinutes,
+    );
+
+    setLastCompletedContext({
+      customerName:
+        completedBooking?.customer?.fullName ||
+        completedBooking?.customer?.name ||
+        completedBooking?.customerName ||
+        "Customer",
+      customerRating:
+        Number.isFinite(customerRatingValue) &&
+        customerRatingValue > 0
+          ? customerRatingValue.toFixed(1)
+          : null,
+      customerRideCount:
+        Number.isFinite(customerRideCountValue) &&
+        customerRideCountValue >= 0
+          ? String(Math.round(customerRideCountValue))
+          : null,
+      passengerCount:
+        Number.isFinite(passengerCountValue) &&
+        passengerCountValue > 0
+          ? String(Math.round(passengerCountValue))
+          : null,
+      pickup:
+        completedBooking?.pickupAddress ||
+        "Pickup location unavailable",
+      drop:
+        completedBooking?.dropAddress ||
+        "Drop location unavailable",
+      distanceKm:
+        Number.isFinite(distanceValue) &&
+        distanceValue >= 0
+          ? distanceValue
+          : null,
+      durationMinutes:
+        Number.isFinite(durationValue) &&
+        durationValue >= 0
+          ? durationValue
+          : null,
+    });
+  }
+
   // =====================================================
   // START RIDE
   // =====================================================
@@ -1832,7 +2481,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       if (
         !response.ok ||
@@ -1916,7 +2565,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       console.log(
         "COMPLETE RIDE RESPONSE:",
@@ -1984,6 +2633,11 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         completion
       );
 
+      captureCompletedContext(
+        result.booking ?? activeRide.booking,
+        completion,
+      );
+
       setMessage(
         `Ride completed • Driver earning ₹${money(
           completion.driverEarning
@@ -2021,7 +2675,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         );
 
       const data =
-        await response.json();
+        await response.json().catch(() => ({}));
 
       setMessage(
         data.success
@@ -2085,7 +2739,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
     const interval =
       setInterval(
         refreshRequests,
-        5000
+        realtimeConnected ? 30000 : 10000
       );
 
     return () => {
@@ -2096,6 +2750,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
   }, [
     online,
     activeRide,
+    realtimeConnected,
   ]);
 
   // =====================================================
@@ -2112,7 +2767,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
     const interval =
       setInterval(
         refreshActiveRide,
-        3000
+        realtimeConnected ? 10000 : 3000
       );
 
     return () => {
@@ -2120,7 +2775,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         interval
       );
     };
-  }, [activeRide]);
+  }, [activeRide, realtimeConnected]);
 
   // =====================================================
   // REAL DRIVER LOCATION
@@ -2302,14 +2957,147 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
 
   const activeRequest = incomingRequest;
   const booking = activeRide?.booking || activeRequest?.booking || {};
-  const currentLeg = activeBooking ? getCurrentDriverLeg(activeBooking) : getRequestLeg(activeRequest);
-  const fare = money(currentLeg?.estimatedFare ?? booking?.estimatedFare ?? 70);
-  const distance = Number(activeRide?.request?.distanceKm ?? activeRequest?.distanceKm ?? currentLeg?.distanceKm ?? 2.8);
-  const eta = Number(activeRide?.request?.etaMinutes ?? activeRequest?.etaMinutes ?? currentLeg?.etaMinutes ?? 8);
-  const customerName = booking?.customer?.name || "Amit Kumar";
-  const pickup = currentLeg?.pickupAddress || booking?.pickupAddress || "Pickup location unavailable";
-  const drop = currentLeg?.dropAddress || booking?.dropAddress || "Drop location unavailable";
-  const vehicleLabel = booking?.goodsVehicleType === "PICKUP_TRUCK" ? "Pickup Truck" : "E-Rickshaw";
+  const currentLeg = activeBooking
+    ? getCurrentDriverLeg(activeBooking)
+    : getRequestLeg(activeRequest);
+
+  const rawFare = Number(
+    currentLeg?.estimatedFare ??
+      booking?.estimatedFare,
+  );
+  const fareAvailable = Number.isFinite(rawFare);
+  const fare = fareAvailable ? money(rawFare) : "—";
+
+  const rawDistance = Number(
+    activeRide?.request?.distanceKm ??
+      activeRequest?.distanceKm ??
+      currentLeg?.distanceKm,
+  );
+  const distanceAvailable =
+    Number.isFinite(rawDistance) && rawDistance >= 0;
+  const distance = distanceAvailable ? rawDistance : 0;
+  const distanceDisplay = distanceAvailable
+    ? `${distance.toFixed(1)} km`
+    : "—";
+
+  const rawEta = Number(
+    activeRide?.request?.etaMinutes ??
+      activeRequest?.etaMinutes ??
+      currentLeg?.etaMinutes,
+  );
+  const etaAvailable =
+    Number.isFinite(rawEta) && rawEta >= 0;
+  const eta = etaAvailable ? rawEta : 0;
+  const etaDisplay = etaAvailable
+    ? `${Math.round(eta)} min`
+    : "—";
+
+  const customerName =
+    booking?.customer?.fullName ||
+    booking?.customer?.name ||
+    booking?.customerName ||
+    "Customer";
+
+  const customerRatingValue = Number(
+    booking?.customer?.rating ??
+      booking?.customerRating,
+  );
+  const customerRating =
+    Number.isFinite(customerRatingValue) &&
+    customerRatingValue > 0
+      ? customerRatingValue.toFixed(1)
+      : null;
+
+  const customerRideCountValue = Number(
+    booking?.customer?.totalRides ??
+      booking?.customer?.ridesCount ??
+      booking?.customer?.rideCount,
+  );
+  const customerRideCount =
+    Number.isFinite(customerRideCountValue) &&
+    customerRideCountValue >= 0
+      ? String(Math.round(customerRideCountValue))
+      : null;
+
+  const passengerCountValue = Number(
+    booking?.passengerCount ??
+      booking?.requestedPassengerCount ??
+      booking?.passengers ??
+      currentLeg?.passengerCount,
+  );
+  const passengerCount =
+    Number.isFinite(passengerCountValue) &&
+    passengerCountValue > 0
+      ? String(Math.round(passengerCountValue))
+      : null;
+
+  const pickup =
+    currentLeg?.pickupAddress ||
+    booking?.pickupAddress ||
+    "Pickup location unavailable";
+
+  const drop =
+    currentLeg?.dropAddress ||
+    booking?.dropAddress ||
+    "Drop location unavailable";
+
+  const pickupLandmark = String(
+    currentLeg?.pickupLandmark ??
+      booking?.pickupLandmark ??
+      "",
+  ).trim();
+
+  const dropLandmark = String(
+    currentLeg?.dropLandmark ??
+      booking?.dropLandmark ??
+      "",
+  ).trim();
+
+  const customerNote = String(
+    booking?.customerNote ??
+      booking?.note ??
+      booking?.instructions ??
+      "",
+  ).trim();
+
+  const goodsWeightValue = Number(
+    booking?.goodsWeightKg ??
+      booking?.weightKg ??
+      currentLeg?.goodsWeightKg,
+  );
+  const goodsWeight =
+    Number.isFinite(goodsWeightValue) && goodsWeightValue > 0
+      ? `${goodsWeightValue.toFixed(2).replace(/\.00$/, "")} kg`
+      : "Weight not provided";
+
+  const vehicleType =
+    booking?.vehicle?.vehicleType ||
+    currentLeg?.vehicle?.vehicleType ||
+    activeRequest?.vehicle?.vehicleType ||
+    "";
+
+  const vehicleLabel =
+    vehicleType === "PICKUP_TRUCK"
+      ? "Pickup Truck"
+      : vehicleType === "E_RICKSHAW"
+        ? "E-Rickshaw"
+        : "Vehicle not assigned";
+
+  const bookingService =
+    String(
+      booking?.serviceType ??
+        booking?.bookingType ??
+        "",
+    ).toUpperCase();
+
+  const serviceLabel =
+    bookingService === "GOODS"
+      ? "Goods"
+      : bookingService === "PARCEL"
+        ? "Parcel"
+        : bookingService === "PASSENGER"
+          ? "Passenger"
+          : rideLabel(booking);
 
   const UI = {
     Header: ({back=false, help=true, backHandler}:{back?:boolean;help?:boolean;backHandler?:()=>void}) => (
@@ -2336,8 +3124,8 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         <View style={{flex:1,marginLeft:10}}>
           <View style={styles.onlinePill}><DriverIcon name="online" size={12} /><Text style={styles.onlinePillText}>{online ? "Online" : "Offline"}</Text></View>
         </View>
-        <Pressable style={styles.bellBtn} onPress={() => setScreen("notifications")}>
-          <DriverIcon name="notification" size={22} /><View style={styles.notificationDot}/>
+        <View style={{flexDirection:"row",alignItems:"center",gap:6,marginRight:8}}><View style={[styles.liveGpsDot,realtimeConnected&&styles.liveGpsDotOn]} /><Text style={{fontSize:9,fontWeight:"800",color:COLORS.muted}}>{realtimeConnected?"LIVE":"SYNC"}</Text></View><Pressable style={styles.bellBtn} onPress={() => setScreen("notifications")}>
+          <DriverIcon name="notification" size={22} />{unreadNotificationCount > 0 ? <View style={styles.notificationDot}/> : null}
         </Pressable>
       </View>
     ),
@@ -2365,8 +3153,8 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
     return <Pressable style={[styles.primary,disabled&&styles.disabled]} onPress={onPress} disabled={disabled}><Text style={styles.primaryText}>{title}</Text><Text style={styles.primaryArrow}>›</Text></Pressable>;
   }
 
-  function Outline({title,onPress}:{title:string;onPress:()=>void}) {
-    return <Pressable style={styles.outline} onPress={onPress}><Text style={styles.outlineText}>{title}</Text><Text style={styles.outlineArrow}>›</Text></Pressable>;
+  function Outline({title,onPress,disabled=false}:{title:string;onPress:()=>void;disabled?:boolean}) {
+    return <Pressable style={[styles.outline,disabled&&styles.disabled]} onPress={onPress} disabled={disabled}><Text style={styles.outlineText}>{title}</Text><Text style={styles.outlineArrow}>›</Text></Pressable>;
   }
 
   function Metric({title,value,accent=false}:{title:string;value:string;accent?:boolean}) {
@@ -2400,7 +3188,47 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
       Number.isFinite(driverCoordinate.latitude) &&
       Number.isFinite(driverCoordinate.longitude);
 
-    const routeCoordinates = [
+    const rawRoute =
+      currentLeg?.routeCoordinates ??
+      booking?.routeCoordinates ??
+      currentLeg?.route?.coordinates ??
+      booking?.route?.coordinates ??
+      [];
+
+    const routeCoordinates = Array.isArray(rawRoute)
+      ? rawRoute
+          .map((point: any) => {
+            if (Array.isArray(point) && point.length >= 2) {
+              const longitude = Number(point[0]);
+              const latitude = Number(point[1]);
+
+              return Number.isFinite(latitude) &&
+                Number.isFinite(longitude)
+                ? { latitude, longitude }
+                : null;
+            }
+
+            const latitude = Number(
+              point?.latitude ??
+                point?.lat,
+            );
+            const longitude = Number(
+              point?.longitude ??
+                point?.lng,
+            );
+
+            return Number.isFinite(latitude) &&
+              Number.isFinite(longitude)
+              ? { latitude, longitude }
+              : null;
+          })
+          .filter(Boolean) as Array<{
+          latitude: number;
+          longitude: number;
+        }>
+      : [];
+
+    const mapPoints = [
       ...(hasDriver ? [driverCoordinate] : []),
       ...(hasPickup ? [pickupCoordinate] : []),
       ...(hasDrop ? [dropCoordinate] : []),
@@ -2413,9 +3241,12 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         : { latitude: FALLBACK_LATITUDE, longitude: FALLBACK_LONGITUDE };
 
     function recenterMap() {
-      const points = routeCoordinates.length >= 2
-        ? routeCoordinates
-        : [center];
+      const points =
+        routeCoordinates.length >= 2
+          ? routeCoordinates
+          : mapPoints.length >= 2
+            ? mapPoints
+            : [center];
 
       if (points.length >= 2) {
         driverMapRef.current?.fitToCoordinates(points, {
@@ -2535,6 +3366,7 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         <Text style={styles.welcomeTitle}>Drive Today{"\n"}<Text style={styles.welcomeGreen}>A Better Tomorrow</Text></Text>
         <Text style={styles.welcomeSub}>Earn. Grow. Be Your Own Boss.</Text>
         <Image source={DRIVER_HERO} resizeMode="contain" style={styles.driverHeroImage}/>
+        <RideXMotionSurface height={58} intensity={0.50} compact muted label="DRIVER FLOW" />
         <View style={styles.welcomeBenefits}>
           <FeatureRow icon="₹" title="Good Earnings"/>
           <FeatureRow icon="◷" title="Flexible Working Hours"/>
@@ -2543,8 +3375,64 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         </View>
         <View style={styles.dots}><Text style={styles.dotActive}>●</Text><Text>●</Text><Text>●</Text></View>
         <Primary title="Login as Driver" onPress={()=>setScreen("login")}/>
-        <Outline title="New Driver? Register Now" onPress={()=>setScreen("login")}/>
+        <Outline title="New Driver? Register Now" onPress={()=>{setRegistrationMobile(mobile);setScreen("registration")}}/>
         <Text style={styles.bottomScript}>Chalo Milkar{"\n"}Behtar Shehar Banaye</Text>
+      </ScrollView>
+    </SafeAreaView>;
+  }
+
+  function RegistrationScreen() {
+    return <SafeAreaView style={styles.page}>
+      <KeyboardAvoidingView style={{flex:1}} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+        <ScrollView contentContainerStyle={styles.authScroll} keyboardShouldPersistTaps="handled">
+          <UI.Header back backHandler={() => setScreen("welcome")} />
+          <Text style={styles.pageTitle}>New Driver Registration</Text>
+          <Text style={styles.pageSub}>Create your RideX driver account. Approval is required before going online.</Text>
+          <RideXMotionSurface height={48} intensity={0.42} compact muted label="ONBOARDING FLOW" />
+          <Text style={styles.fieldLabel}>Full Name</Text>
+          <TextInput value={registrationFullName} onChangeText={setRegistrationFullName} placeholder="Enter your full name" style={styles.formInput} />
+          <Text style={styles.fieldLabel}>Mobile Number</Text>
+          <TextInput value={registrationMobile} onChangeText={setRegistrationMobile} keyboardType="phone-pad" maxLength={10} placeholder="10-digit mobile number" style={styles.formInput} />
+          <Text style={styles.fieldLabel}>Address (Optional)</Text>
+          <TextInput value={registrationAddress} onChangeText={setRegistrationAddress} placeholder="Current address" multiline style={[styles.formInput,{minHeight:90,textAlignVertical:"top"}]} />
+          {registrationOtpSent ? <>
+            <Text style={styles.fieldLabel}>OTP</Text>
+            <TextInput value={registrationOtp} onChangeText={(value) => setRegistrationOtp(value.replace(/\D/g, "").slice(0, 4))} keyboardType="number-pad" maxLength={4} placeholder="Enter OTP" style={styles.formInput} />
+            {authMessage ? <Text style={styles.docSub}>{authMessage}</Text> : null}
+            <Primary title={authLoading ? "Creating Account…" : "Verify & Create Driver Account"} disabled={authLoading} onPress={()=>void completeDriverRegistration()} />
+            <Outline title="Resend OTP" onPress={()=>void resendRegistrationOtp()} />
+          </> : <>
+            {authMessage ? <Text style={styles.docSub}>{authMessage}</Text> : null}
+            <Primary title={authLoading ? "Sending OTP…" : "Send Registration OTP"} disabled={authLoading} onPress={()=>void requestRegistrationOtp()} />
+          </>}
+          <View style={styles.infoBlue}><Text style={styles.infoBlueTitle}>Next steps</Text><Text>OTP verification → KYC/documents → vehicle → Review & Submit → Admin approval → Driver Home.</Text></View>
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </SafeAreaView>;
+  }
+
+  function OnboardingStatusScreen() {
+    const status = String(onboardingStatus?.status || onboardingStatus?.verificationStatus || "INCOMPLETE").toUpperCase();
+    const approved = status === "APPROVED";
+    const rejected = status === "REJECTED";
+    const canSubmit = Boolean(onboardingStatus?.canSubmit);
+    const title = approved ? "Driver Approved" : rejected ? "Changes Required" : status === "UNDER_REVIEW" ? "Under Admin Review" : status === "READY_FOR_SUBMISSION" ? "Ready to Submit" : "Complete Your Application";
+    return <SafeAreaView style={styles.page}>
+      <ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}>
+        <UI.Header back backHandler={()=>setScreen(approved ? "home" : "kyc")} />
+        <Text style={styles.pageTitle}>Application Status</Text>
+        <Text style={styles.pageSub}>RideX controls operational access from this server-side status.</Text>
+        <StatusBanner title={title} sub={`Current status: ${status.replaceAll("_"," ")}`} green={approved || status === "READY_FOR_SUBMISSION" || status === "UNDER_REVIEW"} />
+        <View style={styles.fourCards}>
+          <Metric title="Documents" value={`${onboardingStatus?.documents?.filter((d:any)=>d.hasFile).length || 0}`} />
+          <Metric title="Vehicles" value={`${onboardingStatus?.vehicles?.length || 0}`} />
+          <Metric title="Driver State" value={String(onboardingStatus?.driverStatus || "OFFLINE")} />
+          <Metric title="Verification" value={String(onboardingStatus?.verificationStatus || "PENDING")} />
+        </View>
+        {(onboardingStatus?.rejectionReasons || []).map((r:any)=><View key={`${r.documentType}-${r.reason}`} style={styles.infoBlue}><Text style={styles.infoBlueTitle}>{String(r.documentType).replaceAll("_"," ")}</Text><Text>{String(r.reason)}</Text></View>)}
+        <Primary title="Open KYC & Vehicle" onPress={()=>setScreen("kyc")} />
+        {canSubmit ? <Primary title={actionLoading === "onboarding-submit" ? "Submitting…" : "Review & Submit Application"} disabled={actionLoading === "onboarding-submit"} onPress={()=>void submitDriverOnboarding()} /> : null}
+        {approved ? <Primary title="Go to Driver Home" onPress={()=>setScreen("home")} /> : null}
       </ScrollView>
     </SafeAreaView>;
   }
@@ -2618,10 +3506,17 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
           caretHidden
         />
       </Pressable>
-      <Text style={styles.resend}>Resend OTP in <Text style={styles.greenText}>00:25</Text></Text>
+      <Text style={styles.resend}>
+        Resend is controlled by the RideX backend security policy.
+      </Text>
+      <Outline
+        title="Resend OTP"
+        onPress={() => void resendLoginOtp()}
+        disabled={authLoading}
+      />
       <Primary title={authLoading?"Verifying...":"Verify & Continue"} onPress={verifyOtp} disabled={authLoading}/>
       <Text style={styles.bottomScript}>Saath Chalenge{"\n"}Behtar Shehar Banayenge</Text>
-      <Text style={styles.authMessage}>{authMessage || (RIDEX_TEST_MODE ? "Test OTP: 1234" : "Enter the OTP sent to your mobile")}</Text>
+      <Text style={styles.authMessage}>{authMessage || "Enter the OTP sent to your mobile"}</Text>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>;
@@ -2633,16 +3528,17 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
         <UI.TopProfile/>
         <View style={styles.homeBrandLine}><View><Text style={styles.hello}>Hello, {driverProfile?.fullName || driverProfile?.name || driverProfile?.user?.fullName || driverProfile?.user?.name || "Driver"}</Text><Text style={styles.helloSub}>Drive Safe, Earn More!</Text></View><Pressable onPress={toggleOnline} disabled={loading} style={[styles.onlineToggle,online&&styles.onlineToggleOn,loading&&styles.onlineToggleDisabled]} accessibilityRole="switch" accessibilityState={{checked:online,busy:loading}}><Text style={styles.onlineToggleText}>{loading?"Updating…":online?"Online":"Offline"}</Text><View style={styles.toggleKnob}/></Pressable></View>
         <MapCard/>
+        <RideXMotionSurface height={54} intensity={0.45} compact muted label={activeRide ? "ACTIVE DRIVER FLOW" : "NETWORK FLOW"} />
         {online ? <View style={styles.requestHomeSection}>
           <View style={styles.activityHeader}><View style={styles.sectionTitleWrap}><DriverIcon name="rides" size={18}/><Text style={styles.sectionTitle}>Ride Requests</Text></View><Text style={styles.requestCount}>{requests.length}/4</Text></View>
           {requests.length===0 ? <View style={styles.emptyRequestCard}><DriverIcon name="notification" size={24}/><View style={{flex:1}}><Text style={styles.emptyRequestTitle}>No new requests</Text><Text style={styles.emptyRequestSub}>We’ll show compatible rides from your approved working routes.</Text></View></View> : requests.slice(0,4).map((r: DriverRequest)=><Pressable key={r.id} style={styles.homeRequestCard} onPress={()=>{setIncomingRequest(r);setScreen("request");}}>
             <View style={styles.homeRequestIcon}><DriverIcon name={String(r.booking?.bookingType||"").toUpperCase()==="GOODS"?"goods":"rides"} size={22}/></View>
-            <View style={{flex:1}}><Text style={styles.homeRequestTitle}>{String(r.booking?.bookingType||"RIDE").replaceAll("_"," ")}</Text><Text style={styles.homeRequestRoute}>{String(r.booking?.pickupAddress||"Pickup")} → {String(r.booking?.dropAddress||"Drop")}</Text><Text style={styles.homeRequestMeta}>{Number(r.distanceKm||0).toFixed(1)} km • {Number(r.etaMinutes||0)} min • ₹{money(r.leg?.estimatedFare ?? r.booking?.estimatedFare ?? 0)}</Text></View><DriverIcon name="chevron_right" size={18}/></Pressable>)}
+            <View style={{flex:1}}><Text style={styles.homeRequestTitle}>{String(r.booking?.serviceType || r.booking?.bookingType || "Passenger").replaceAll("_"," ")}</Text><Text style={styles.homeRequestRoute}>{String(r.booking?.pickupAddress||"Pickup")} → {String(r.booking?.dropAddress||"Drop")}</Text><Text style={styles.homeRequestMeta}>{Number(r.distanceKm||0).toFixed(1)} km • {Number(r.etaMinutes||0)} min • ₹{money(r.leg?.estimatedFare ?? r.booking?.estimatedFare ?? 0)}</Text></View><DriverIcon name="chevron_right" size={18}/></Pressable>)}
         </View> : null}
         {activeRide ? <View style={styles.activeHomeCard}>
           <View style={styles.activityHeader}><View style={styles.sectionTitleWrap}><DriverIcon name="rides" size={18}/><Text style={styles.sectionTitle}>Active Ride</Text></View><Text style={styles.activeRideStatus}>{String(activeRide.booking?.status||"ACTIVE").replaceAll("_"," ")}</Text></View>
           <Text style={styles.homeRequestRoute}>{String(activeRide.booking?.pickupAddress||"Pickup")} → {String(activeRide.booking?.dropAddress||"Drop")}</Text>
-          <Text style={styles.homeRequestMeta}>{Number(activeRide.request?.distanceKm||0).toFixed(1)} km • {Number(activeRide.request?.etaMinutes||0)} min</Text>
+          <Text style={styles.homeRequestMeta}>{Number.isFinite(Number(activeRide.request?.distanceKm)) ? `${Number(activeRide.request?.distanceKm).toFixed(1)} km` : "—"} • {Number.isFinite(Number(activeRide.request?.etaMinutes)) ? `${Math.round(Number(activeRide.request?.etaMinutes))} min` : "ETA —"}</Text>
           <Primary title="Open Active Ride" onPress={()=>{const st=String(activeRide.booking?.status||""); setScreen(st==="DRIVER_ARRIVED"?"arrived":(st==="STARTED"||st==="IN_PROGRESS")?"trip":"accepted")}}/>
         </View> : null}
         <View style={styles.summaryRow}><View style={styles.todayEarn}><Text style={styles.todayLabel}>Today's Earnings</Text><Text style={styles.todayValue}>₹{money(earningRows.filter((r:any)=>{const d=new Date(r.createdAt||0); const n=new Date(); return d.toDateString()===n.toDateString();}).reduce((sum:number,r:any)=>sum+Number(r.netEarning||0),0))}</Text><Text style={styles.moreArrow}>›</Text></View><Metric title="Today's Rides" value={`${earningRows.filter((r:any)=>{const d=new Date(r.createdAt||0); const n=new Date(); return d.toDateString()===n.toDateString();}).length}`}/><Metric title="Online Time" value={onlineSince ? `${Math.floor((onlineClock-onlineSince)/3600000)}h ${Math.floor(((onlineClock-onlineSince)%3600000)/60000)}m` : "—"}/></View>
@@ -2661,50 +3557,25 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
           return <View key={r.id} style={styles.activityRow}><Text style={styles.activityTime}>{created.toLocaleTimeString([], {hour:"numeric", minute:"2-digit"})}</Text><View style={[styles.activityDot,{backgroundColor:cancelled?COLORS.red:"#0AA35A"}]}/><View style={{flex:1}}><Text style={styles.activityTitle}>{cancelled?"Cancelled Ride":"Completed Ride"}</Text><Text style={styles.activitySub}>{route}</Text></View><Text style={styles.activityFare}>₹{money(Number(r.netEarning||0))}</Text></View>;
         })}
         </View>
-        <Pressable style={styles.serviceShortcut} onPress={()=>setScreen("serviceMode")}><Text style={styles.shortLabel}>Today's Service Mode</Text><Text style={styles.shortValue}>{serviceMode}</Text><Text style={styles.link}>Edit ›</Text></Pressable>
       </ScrollView><UI.BottomNav active="home"/>
     </SafeAreaView>;
-  }
-
-  function ServiceModeScreen() {
-    const approvedVehicleStatuses = new Set(["ACTIVE","VERIFIED"]);
-    const hasRickshaw = driverVehicles.some((v:any) => String(v?.vehicleType||"").toUpperCase() === "E_RICKSHAW" && approvedVehicleStatuses.has(String(v?.status||"").toUpperCase()));
-    const hasPickup = driverVehicles.some((v:any) => String(v?.vehicleType||"").toUpperCase() === "PICKUP_TRUCK" && v?.goodsEligible !== false && approvedVehicleStatuses.has(String(v?.status||"").toUpperCase()));
-    const modes: Array<{
-      id: "PASSENGER" | "GOODS" | "BOTH";
-      title: string;
-      subtitle: string;
-      icon: string;
-      bg: string;
-      checks: string[];
-    }> = [
-      ...(hasRickshaw ? [{id:"PASSENGER" as const,title:"Passenger + Parcel",subtitle:"Passenger rides and eligible Parcel delivery",icon:"passenger",bg:"#EAF8F1",checks:["Full / Shared / Connection rides","Parcel delivery","E-Rickshaw only"]}] : []),
-      ...(hasPickup ? [{id:"GOODS" as const,title:"Goods Availability",subtitle:"Battery Pickup Truck • Goods only",icon:"goods",bg:"#F1ECFF",checks:["Goods only","Duration booking","No passenger / parcel"]}] : []),
-      ...(hasRickshaw && hasPickup ? [{id:"BOTH" as const,title:"Both Services",subtitle:"Receive Passenger/Parcel + Goods requests",icon:"both",bg:"#FFF5E4",checks:["Use both eligible vehicles","Flexible work options","More requests"]}] : [])
-    ];
-    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}>
-      <UI.Header back/><Text style={styles.pageTitle}>Service Mode</Text><Text style={styles.pageSub}>Choose the type of rides you want to receive</Text>
-      <View style={styles.infoGreen}><DriverIcon name="settings" size={18}/><Text style={styles.infoText}>You can change your service mode anytime.</Text></View>
-      {modes.length===0 ? <View style={styles.infoGreen}><DriverIcon name="vehicle" size={20}/><Text style={styles.infoText}>No ACTIVE/VERIFIED eligible vehicle is linked to this driver. Complete vehicle approval in KYC before selecting a service mode.</Text></View> : null}
-      {modes.map(m=><Pressable key={m.id} style={[styles.modeCard,{backgroundColor:m.bg},serviceMode===m.id&&styles.modeSelected]} onPress={()=>void changeServiceMode(m.id)}><View style={styles.modeVehicleBox}><DriverIcon name={m.icon as any} size={30} /></View><View style={{flex:1}}><Text style={styles.modeTitle}>{m.title}</Text><Text style={styles.modeSub}>{m.subtitle}</Text>{m.checks.map(x=><View key={x} style={styles.checkLineRow}><DriverIcon name="check" size={15}/><Text style={styles.checkLine}>{x}</Text></View>)}</View><View style={styles.radio}>{serviceMode===m.id?<DriverIcon name="check" size={20}/>:<View style={styles.radioEmpty}/>}</View></Pressable>)}
-<View style={styles.infoGreen}><Text style={styles.infoText}>Parcel service follows Passenger E-Rickshaw eligibility. Goods is available only to the Battery Pickup Truck.</Text></View>      <Primary title="Save & Continue" onPress={goHome}/>
-    </ScrollView></SafeAreaView>;
   }
 
   function RequestScreen() {
     const req=activeRequest;
     if(!req) return HomeScreen();
-    const requestExpiresAt = req.expiresAt ? new Date(req.expiresAt).getTime() : requestNow + 300000;
+    const requestExpiresAt = req.expiresAt ? new Date(req.expiresAt).getTime() : requestNow;
     const remainingSeconds = Math.max(0, Math.ceil((requestExpiresAt - requestNow) / 1000));
     const reqFare=money(getRequestLeg(req)?.estimatedFare ?? req.booking?.estimatedFare ?? 70);
     return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}>
       <View style={styles.requestHead}><UI.Header help={false}/><Text style={styles.requestTitle}>New Ride Request</Text><Text style={styles.requestSub}>A new ride request is nearby!</Text><View style={styles.timer}><Text style={styles.timerNum}>{remainingSeconds}</Text><Text style={styles.timerText}>seconds</Text></View></View>
+      <RideXMotionSurface height={54} intensity={0.60} compact label="REQUEST MATCH FLOW" />
       <MapCard/>
       <View style={styles.requestCard}>
         <View style={styles.threeMetrics}><Metric title="Distance" value={`${distance.toFixed(1)} km`}/><Metric title="Estimated Fare" value={`₹${reqFare}`} accent/><Metric title="Pickup Time" value={`${eta} min`}/></View>
-        <View style={styles.customerCard}><View style={styles.customerAvatar}><Text>AK</Text></View><View style={{flex:1}}><Text style={styles.customerName}>{customerName}</Text><Text style={styles.customerRating}>★ 4.8 (120 rides)</Text></View><Pressable style={styles.actionCircle} onPress={()=>{ if (booking?.customer?.mobile) Linking.openURL(`tel:${booking.customer.mobile}`); else setMessage("Customer phone number is not available."); }}><DriverIcon name="phone" size={18}/></Pressable><Pressable style={styles.actionCircleBlue} onPress={()=>setScreen("messages")}><DriverIcon name="chat" size={18}/></Pressable></View>
-        <View style={styles.locationGrid}><View><View style={{flexDirection:"row",alignItems:"center",gap:6}}><DriverIcon name="pickup" size={15}/><Text style={styles.locationGreen}>Pickup Location</Text></View><Text style={styles.locationText}>{pickup}</Text><Text style={styles.locationSub}>Near ICICI Bank</Text></View><View><View style={{flexDirection:"row",alignItems:"center",gap:6}}><DriverIcon name="drop" size={15}/><Text style={styles.locationRed}>Drop Location</Text></View><Text style={styles.locationText}>{drop}</Text><Text style={styles.locationSub}>Platform No. 1</Text></View></View>
-        <View style={styles.note}><Text style={styles.requestNoteTitle}>{req.booking?.bookingType==="GOODS"?"Goods":"Note from Passenger"}</Text><Text style={styles.noteText}>{req.booking?.bookingType==="GOODS"?`${req.booking?.goodsType||"Parcel"} • ${req.booking?.goodsWeightKg??50} kg • ${vehicleLabel}`:"I will be waiting near the main gate."}</Text></View>
+        <View style={styles.customerCard}><View style={styles.customerAvatar}><Text>AK</Text></View><View style={{flex:1}}><Text style={styles.customerName}>{customerName}</Text><Text style={styles.customerRating}>{customerRating ? `★ ${customerRating}${customerRideCount ? ` (${customerRideCount} rides)` : ""}` : "Customer rating not available"}</Text></View><Pressable style={styles.actionCircle} onPress={()=>{ if (booking?.customer?.mobile) Linking.openURL(`tel:${booking.customer.mobile}`); else setMessage("Customer phone number is not available."); }}><DriverIcon name="phone" size={18}/></Pressable><Pressable style={styles.actionCircleBlue} onPress={()=>setScreen("messages")}><DriverIcon name="chat" size={18}/></Pressable></View>
+        <View style={styles.locationGrid}><View><View style={{flexDirection:"row",alignItems:"center",gap:6}}><DriverIcon name="pickup" size={15}/><Text style={styles.locationGreen}>Pickup Location</Text></View><Text style={styles.locationText}>{pickup}</Text><Text style={styles.locationSub}>{pickupLandmark || "Pickup landmark not provided"}</Text></View><View><View style={{flexDirection:"row",alignItems:"center",gap:6}}><DriverIcon name="drop" size={15}/><Text style={styles.locationRed}>Drop Location</Text></View><Text style={styles.locationText}>{drop}</Text><Text style={styles.locationSub}>{dropLandmark || "Drop landmark not provided"}</Text></View></View>
+        <View style={styles.note}><Text style={styles.requestNoteTitle}>{req.booking?.bookingType==="GOODS"?"Goods":"Note from Passenger"}</Text><Text style={styles.noteText}>{req.booking?.bookingType==="GOODS" ? `${req.booking?.goodsType || serviceLabel} • ${goodsWeight} • ${vehicleLabel}` : (customerNote || "No note provided")}</Text></View>
         <View style={styles.acceptRow}><Pressable style={styles.decline} onPress={()=>{void rejectRide(req.id);setIncomingRequest(null);goHome()}}><Text style={styles.declineText}>Decline</Text></Pressable><Pressable style={[styles.accept, remainingSeconds===0&&{opacity:0.55}]} disabled={remainingSeconds===0 || actionLoading===req.id} onPress={()=>void acceptRide(req)}><Text style={styles.acceptText}>{remainingSeconds===0?'Expired':'Accept Ride'}</Text></Pressable></View>
       </View>
     </ScrollView></SafeAreaView>;
@@ -2713,30 +3584,52 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
   function ActiveRide({kind}:{kind:"accepted"|"arrived"|"trip"}) {
     const title = kind==="accepted"?"Ride Accepted!":kind==="arrived"?"Passenger has arrived!":"Trip in Progress";
     const sub = kind==="accepted"?"Head to the pickup location":kind==="arrived"?"Verify OTP/QR and start the trip":"Drive safely to the drop location";
+    const target = kind === "trip" ? { latitude: Number(currentLeg?.dropLat ?? booking?.dropLat), longitude: Number(currentLeg?.dropLng ?? booking?.dropLng) } : { latitude: Number(currentLeg?.pickupLat ?? booking?.pickupLat), longitude: Number(currentLeg?.pickupLng ?? booking?.pickupLng) };
+    const routeDrift = computeCoordinateDriftScore({
+      current: gpsEnabled ? { latitude: Number(gpsLatitude), longitude: Number(gpsLongitude) } : null,
+      target: Number.isFinite(target.latitude) && Number.isFinite(target.longitude) ? target : null,
+      plannedDistanceKm: distance,
+      plannedEtaMinutes: eta,
+    });
     return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:35}}>
       <UI.Header back/>
       <StatusBanner title={title} sub={sub}/>
       <MapCard/>
+      <RideXMotionSurface height={66} intensity={0.72} compact label={kind === "trip" ? "DROP ROUTE ALIGN" : "PICKUP ROUTE ALIGN"} driftScore={routeDrift} />
       <View style={styles.rideCard}>
-        <View style={styles.customerCard}><Image source={DRIVER_AVATAR} style={styles.customerPhoto}/><View style={{flex:1}}><Text style={styles.customerName}>{customerName}</Text><Text style={styles.customerRating}>★ 4.8 (120 rides)</Text><Text style={styles.customerSub}>1 Passenger</Text></View><Pressable style={styles.actionCircle} onPress={()=>{ if (booking?.customer?.mobile) Linking.openURL(`tel:${booking.customer.mobile}`); else setMessage("Customer phone number is not available."); }}><DriverIcon name="phone" size={18}/></Pressable><Pressable style={styles.actionCircleBlue} onPress={()=>setScreen("messages")}><DriverIcon name="chat" size={18}/></Pressable></View>
-        <View style={styles.locationGrid}><View><View style={{flexDirection:"row",alignItems:"center",gap:6}}><DriverIcon name="pickup" size={15}/><Text style={styles.locationGreen}>Pickup Location</Text></View><Text style={styles.locationText}>{pickup}</Text><Text style={styles.locationSub}>Near ICICI Bank</Text></View><View><View style={{flexDirection:"row",alignItems:"center",gap:6}}><DriverIcon name="drop" size={15}/><Text style={styles.locationRed}>Drop Location</Text></View><Text style={styles.locationText}>{drop}</Text><Text style={styles.locationSub}>Platform No. 1</Text></View></View>
+        <View style={styles.customerCard}><Image source={DRIVER_AVATAR} style={styles.customerPhoto}/><View style={{flex:1}}><Text style={styles.customerName}>{customerName}</Text><Text style={styles.customerRating}>{customerRating ? `★ ${customerRating}${customerRideCount ? ` (${customerRideCount} rides)` : ""}` : "Customer rating not available"}</Text><Text style={styles.customerSub}>{passengerCount ? `${passengerCount} Passenger${passengerCount === "1" ? "" : "s"}` : "Passenger count not provided"}</Text></View><Pressable style={styles.actionCircle} onPress={()=>{ if (booking?.customer?.mobile) Linking.openURL(`tel:${booking.customer.mobile}`); else setMessage("Customer phone number is not available."); }}><DriverIcon name="phone" size={18}/></Pressable><Pressable style={styles.actionCircleBlue} onPress={()=>setScreen("messages")}><DriverIcon name="chat" size={18}/></Pressable></View>
+        <View style={styles.locationGrid}><View><View style={{flexDirection:"row",alignItems:"center",gap:6}}><DriverIcon name="pickup" size={15}/><Text style={styles.locationGreen}>Pickup Location</Text></View><Text style={styles.locationText}>{pickup}</Text><Text style={styles.locationSub}>{pickupLandmark || "Pickup landmark not provided"}</Text></View><View><View style={{flexDirection:"row",alignItems:"center",gap:6}}><DriverIcon name="drop" size={15}/><Text style={styles.locationRed}>Drop Location</Text></View><Text style={styles.locationText}>{drop}</Text><Text style={styles.locationSub}>{dropLandmark || "Drop landmark not provided"}</Text></View></View>
         <View style={styles.fareRow}><Metric title="Estimated Fare" value={`₹${fare}`} accent/><Metric title="Payment" value={paymentLabel(activeRide?.booking)}/></View>
         {kind==="arrived" ? <View style={styles.pinCard}><View style={{flexDirection:"row",alignItems:"center",gap:8}}><DriverIcon name="shield" size={18}/><Text style={styles.pinTitle}>Ride Verification</Text></View><Text style={styles.pinSub}>Choose OTP or QR before starting the ride.</Text><View style={{flexDirection:"row",gap:8,marginTop:10}}><Pressable style={[styles.actionCircleBlue,verificationMethod==="OTP"&&styles.modeSelected]} onPress={()=>void prepareVerification("OTP")}><Text>OTP</Text></Pressable><Pressable style={[styles.actionCircleBlue,verificationMethod==="QR"&&styles.modeSelected]} onPress={()=>void prepareVerification("QR")}><Text>QR</Text></Pressable></View>{verificationMethod==="OTP"?<TextInput value={tripPin} onChangeText={v=>setTripPin(v.replace(/\D/g,"").slice(0,4))} style={styles.pinInput} keyboardType="number-pad" maxLength={4} placeholder="OTP" placeholderTextColor="#9CA5B3"/>:qrPayload?<View style={{alignItems:"center",padding:12}}><QRCode value={qrPayload} size={190}/><Text style={styles.pinSub}>Expires {verificationExpiresAt ? new Date(verificationExpiresAt).toLocaleTimeString() : "soon"}</Text></View>:<Text style={styles.pinSub}>Tap QR to generate.</Text>}</View>:null}
-        {kind==="trip" ? <View style={styles.tripDetails}><Text style={styles.sectionTitle}>Trip Details</Text><View style={styles.detailLine}><DriverIcon name="pickup" size={15}/><Text style={{flex:1}}>{pickup}</Text><Text style={styles.detailTime}>08:15 PM</Text></View><View style={styles.detailLine}><DriverIcon name="drop" size={15}/><Text style={{flex:1}}>{drop}</Text><Text style={styles.detailTime}>08:25 PM (ETA)</Text></View></View>:null}
+        {kind==="trip" ? <View style={styles.tripDetails}><Text style={styles.sectionTitle}>Trip Details</Text><View style={styles.detailLine}><DriverIcon name="pickup" size={15}/><Text style={{flex:1}}>{pickup}</Text><Text style={styles.detailTime}>{activeBooking?.driverArrivedAt ? new Date(activeBooking.driverArrivedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "—"}</Text></View><View style={styles.detailLine}><DriverIcon name="drop" size={15}/><Text style={{flex:1}}>{drop}</Text><Text style={styles.detailTime}>{etaAvailable ? `${Math.round(eta)} min ETA` : "ETA not available"}</Text></View></View>:null}
         {kind==="accepted" ? (
-          <Primary
-            title="Start Navigation"
-            onPress={async () => {
-              const targetLat = Number(currentLeg?.pickupLat ?? activeRequest?.booking?.pickupLat);
-              const targetLng = Number(currentLeg?.pickupLng ?? activeRequest?.booking?.pickupLng);
-              if (Number.isFinite(targetLat) && Number.isFinite(targetLng)) {
-                const url = `https://www.google.com/maps/dir/?api=1&destination=${targetLat},${targetLng}&travelmode=driving`;
-                try { await Linking.openURL(url); } catch { setMessage("Unable to open navigation."); }
-              } else {
-                setMessage("Pickup coordinates are not available for navigation.");
-              }
-            }}
-          />
+          <>
+            <Primary
+              title="Start Navigation"
+              onPress={async () => {
+                const targetLat = Number(currentLeg?.pickupLat ?? activeRequest?.booking?.pickupLat);
+                const targetLng = Number(currentLeg?.pickupLng ?? activeRequest?.booking?.pickupLng);
+
+                if (Number.isFinite(targetLat) && Number.isFinite(targetLng)) {
+                  const url = `https://www.google.com/maps/dir/?api=1&destination=${targetLat},${targetLng}&travelmode=driving`;
+
+                  try {
+                    await Linking.openURL(url);
+                  } catch {
+                    setMessage("Unable to open navigation.");
+                  }
+                } else {
+                  setMessage("Pickup coordinates are not available for navigation.");
+                }
+              }}
+            />
+
+            <Primary
+              title={loading ? "Marking Arrival…" : "I've Arrived"}
+              onPress={markArrived}
+              disabled={!canArrive || loading}
+            />
+          </>
         ) : kind==="arrived" ? (
           <>
             <Primary title="Start Trip" onPress={startRide} disabled={!canStart||loading}/>
@@ -2766,53 +3659,1036 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
   }
 
   function CompletedScreen() {
-    const earning=lastCompletion?.driverEarning??70;
-    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}>
-      <UI.Header back/><StatusBanner title="Trip Completed!" sub="Great job! You have successfully completed the ride."/>
-      <View style={styles.earnedHero}><Text style={styles.earnedLabel}>Total Fare Earned</Text><Text style={styles.earnedValue}>₹{money(earning)}</Text><View style={styles.cashPillRow}><DriverIcon name="rupee" size={15}/><Text style={styles.cashPill}>{paymentLabel({ paymentPreference: lastCompletion?.paymentMethod })} Payment</Text></View></View>
-      <View style={styles.rideCard}><View style={styles.customerCard}><Image source={DRIVER_AVATAR} style={styles.customerPhoto}/><View style={{flex:1}}><Text style={styles.customerName}>{customerName}</Text><Text style={styles.customerRating}>★ 4.8 (120 rides)</Text><Text style={styles.customerSub}>1 Passenger</Text></View><Text style={styles.sectionTitle}>Trip Rating</Text></View><View style={styles.locationStack}><Text>🟢 {pickup}</Text><Text>🔴 {drop}</Text><Text>🛣 {distance.toFixed(1)} km   ◷ 13 min</Text></View></View>
-      <View style={styles.keepUp}><Text style={styles.keepUpTitle}>🏆 Keep it up!</Text><Text style={styles.keepUpSub}>You are making cities move better. 🛺💚</Text></View>
-      <View style={styles.rateCard}><Text style={styles.sectionTitle}>How was your passenger?</Text><Text style={styles.stars}>☆ ☆ ☆ ☆ ☆</Text><Text style={styles.rateHint}>Tap to rate (Optional)</Text></View>
-      <Primary title="Go Online for Next Ride" onPress={()=>{setLastCompletion(null);goHome()}}/><Outline title="Back to Home" onPress={goHome}/>
-    </ScrollView></SafeAreaView>;
+    const earning = lastCompletion?.driverEarning;
+
+    const earningAvailable =
+      Number.isFinite(Number(earning));
+
+    const completionDistance =
+      lastCompletedContext?.distanceKm;
+
+    const completionDuration =
+      lastCompletedContext?.durationMinutes;
+
+    const completionDistanceLabel =
+      typeof completionDistance === "number" &&
+      Number.isFinite(completionDistance)
+        ? `${completionDistance.toFixed(1)} km`
+        : "Distance not available";
+
+    const completionDurationLabel =
+      typeof completionDuration === "number" &&
+      Number.isFinite(completionDuration)
+        ? `${Math.round(completionDuration)} min`
+        : "Duration not available";
+
+    const completedCustomerName =
+      lastCompletedContext?.customerName ||
+      "Customer";
+
+    const completedCustomerRating =
+      lastCompletedContext?.customerRating;
+
+    const completedCustomerRideCount =
+      lastCompletedContext?.customerRideCount;
+
+    const completedPassengerCount =
+      lastCompletedContext?.passengerCount;
+
+    const completedPickup =
+      lastCompletedContext?.pickup ||
+      "Pickup location unavailable";
+
+    const completedDrop =
+      lastCompletedContext?.drop ||
+      "Drop location unavailable";
+
+    return (
+      <SafeAreaView style={styles.page}>
+        <ScrollView
+          contentContainerStyle={{
+            padding: 16,
+            paddingBottom: 120,
+          }}
+        >
+          <UI.Header back />
+
+          <StatusBanner
+            title="Trip Completed!"
+            sub="Ride completion was confirmed by the RideX backend."
+          />
+
+          <View style={styles.earnedHero}>
+            <Text style={styles.earnedLabel}>
+              Driver Earnings
+            </Text>
+
+            <Text style={styles.earnedValue}>
+              {earningAvailable
+                ? `₹${money(Number(earning))}`
+                : "—"}
+            </Text>
+
+            <View style={styles.cashPillRow}>
+              <DriverIcon
+                name="rupee"
+                size={15}
+              />
+
+              <Text style={styles.cashPill}>
+                {lastCompletion?.paymentMethod
+                  ? `${paymentLabel({
+                      paymentPreference:
+                        lastCompletion.paymentMethod,
+                    })} Payment`
+                  : "Payment method not available"}
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.rideCard}>
+            <View style={styles.customerCard}>
+              <Image
+                source={DRIVER_AVATAR}
+                style={styles.customerPhoto}
+              />
+
+              <View style={{ flex: 1 }}>
+                <Text style={styles.customerName}>
+                  {completedCustomerName}
+                </Text>
+
+                <Text style={styles.customerRating}>
+                  {completedCustomerRating
+                    ? `★ ${completedCustomerRating}${
+                        completedCustomerRideCount
+                          ? ` (${completedCustomerRideCount} rides)`
+                          : ""
+                      }`
+                    : "Customer rating not available"}
+                </Text>
+
+                <Text style={styles.customerSub}>
+                  {completedPassengerCount
+                    ? `${completedPassengerCount} Passenger${
+                        completedPassengerCount ===
+                        "1"
+                          ? ""
+                          : "s"
+                      }`
+                    : "Passenger count not provided"}
+                </Text>
+              </View>
+
+              <Text style={styles.sectionTitle}>
+                Trip Rating
+              </Text>
+            </View>
+
+            <View style={styles.locationStack}>
+              <Text>
+                🟢 {completedPickup}
+              </Text>
+
+              <Text>
+                🔴 {completedDrop}
+              </Text>
+
+              <Text>
+                🛣 {completionDistanceLabel}   ◷{" "}
+                {completionDurationLabel}
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.keepUp}>
+            <Text style={styles.keepUpTitle}>
+              Trip completed
+            </Text>
+
+            <Text style={styles.keepUpSub}>
+              Your completion and earnings are recorded by
+              RideX.
+            </Text>
+          </View>
+
+          <Primary
+            title="Go Online for Next Ride"
+            onPress={() => {
+              setLastCompletion(null);
+              setLastCompletedContext(null);
+              goHome();
+            }}
+          />
+
+          <Outline
+            title="Back to Home"
+            onPress={goHome}
+          />
+        </ScrollView>
+      </SafeAreaView>
+    );
   }
 
   function HistoryScreen() {
-    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}><UI.TopProfile/><Text style={styles.pageTitle}>Ride History</Text><Text style={styles.pageSub}>Your completed and cancelled rides</Text><View style={styles.filterRow}>{['All Rides','Completed','Cancelled'].map((x,i)=><Pressable key={x} style={[styles.filterPill,i===0&&styles.filterActive]}><Text style={[styles.filterText,i===0&&styles.filterActiveText]}>{x}</Text></Pressable>)}</View>{earningRows.length===0?<View style={styles.emptyState}><DriverIcon name="rides" size={30}/><Text style={styles.sectionTitle}>No ride history yet</Text><Text style={styles.docSub}>Completed driver earnings will appear here.</Text></View>:earningRows.map((row:any)=>{const b=row.booking||{};const status=String(b.status||row.status||'').toUpperCase();return <View key={row.id} style={styles.historyCard}><View style={styles.historyTop}><Text style={styles.historyDate}>{new Date(row.createdAt||Date.now()).toLocaleString()}</Text><Text style={[styles.historyStatus,status.includes('CANCEL')?styles.statusCancelled:styles.statusCompleted]}>{status||'COMPLETED'}</Text></View><Text style={styles.historyRoute}>{String(b.pickupAddress||'Pickup')}</Text><Text style={styles.historyRoute}>{String(b.dropAddress||'Drop')}</Text><View style={styles.historyBottom}><Text style={styles.historyFare}>₹{money(Number(row.netEarning||0))}</Text><Text style={styles.historyChevron}>›</Text></View></View>})}</ScrollView><UI.BottomNav active="rides"/></SafeAreaView>;
+    const visibleRows = historyRows.filter((row:any) => {
+      const status = String(row.status || "").toUpperCase();
+      if (historyFilter === "COMPLETED") return status === "COMPLETED";
+      if (historyFilter === "CANCELLED") return status === "CANCELLED";
+      return true;
+    });
+    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}>
+      <UI.TopProfile/><View style={{flexDirection:"row",alignItems:"center",justifyContent:"space-between"}}><View><Text style={styles.pageTitle}>Ride History</Text><Text style={styles.pageSub}>Your RideX trips and their current outcomes</Text></View><Pressable onPress={()=>void loadDriverHistory(driverId)}><Text style={styles.markAllText}>Refresh</Text></Pressable></View>
+      <View style={styles.filterRow}>{[["ALL","All Rides"],["COMPLETED","Completed"],["CANCELLED","Cancelled"]].map(([key,label])=><Pressable key={key} onPress={()=>setHistoryFilter(key)} style={[styles.filterPill,historyFilter===key&&styles.filterActive]}><Text style={[styles.filterText,historyFilter===key&&styles.filterActiveText]}>{label}</Text></Pressable>)}</View>
+      {visibleRows.length===0?<View style={styles.emptyState}><DriverIcon name="rides" size={30}/><Text style={styles.sectionTitle}>No ride history</Text><Text style={styles.docSub}>Completed and cancelled bookings will appear here.</Text></View>:visibleRows.map((row:any)=>{const earning=Array.isArray(row.driverEarnings)?row.driverEarnings[0]:null;const status=String(row.status||"UNKNOWN").toUpperCase();return <Pressable key={row.id} onPress={()=>{setMessage(`Booking ${row.id}`)}} style={styles.historyCard}><View style={styles.historyTop}><Text style={styles.historyDate}>{row.updatedAt ? new Date(row.updatedAt).toLocaleString() : ""}</Text><Text style={[styles.historyStatus,status.includes("CANCEL")?styles.statusCancelled:styles.statusCompleted]}>{status}</Text></View><Text style={styles.historyRoute}>{String(row.pickupAddress||"Pickup")}</Text><Text style={styles.historyRoute}>{String(row.dropAddress||"Drop")}</Text><View style={styles.historyBottom}><Text style={styles.historyFare}>{earning?.netEarning != null || row.finalFare != null || row.estimatedFare != null ? `₹${money(Number(earning?.netEarning ?? row.finalFare ?? row.estimatedFare))}` : "—"}</Text><Text style={styles.historyChevron}>{rideLabel(row)} ›</Text></View></Pressable>})}
+    </ScrollView><UI.BottomNav active="rides"/></SafeAreaView>;
   }
 
   function EarningsScreen() {
     const rows = earningRows.slice(0,10);
-    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}><UI.TopProfile/><Text style={styles.pageTitle}>Earnings</Text><Text style={styles.pageSub}>Track your income and payouts</Text><View style={styles.earningsHero}><Text style={styles.earningsLabel}>Total Net Earnings</Text><Text style={styles.earningsValue}>₹{money(earningTotals.net)}</Text><View style={styles.earnStats}><Text>₹{money(earningRows.length?earningTotals.net/earningRows.length:0)}{"\n"}Avg. per Ride</Text><Text>{earningRows.length}{"\n"}Earning Records</Text><Text>₹{money(earningTotals.commission)}{"\n"}Commission</Text></View></View><View style={styles.fourCards}><Metric title="Gross Earnings" value={`₹${money(earningTotals.gross)}`}/><Metric title="Commission" value={`₹${money(earningTotals.commission)}`}/><Metric title="Net Earnings" value={`₹${money(earningTotals.net)}`}/><Metric title="Total Rides" value={`${earningRows.length}`}/></View><Text style={styles.sectionTitle}>Recent Earnings</Text>{rows.length===0?<View style={styles.emptyState}><DriverIcon name="earnings" size={30}/><Text style={styles.sectionTitle}>No earnings yet</Text><Text style={styles.docSub}>Completed trips will populate your earnings here.</Text></View>:rows.map((r:any)=><View key={r.id} style={styles.breakRow}><Text>{new Date(r.createdAt||Date.now()).toLocaleDateString()}</Text><Text>{r.booking?.serviceSubtype||'Ride'}</Text><Text style={styles.breakFare}>₹{money(Number(r.netEarning||0))}</Text></View>)}<Primary title="View Payout History" onPress={()=>setScreen("payout")}/></ScrollView><UI.BottomNav active="earnings"/></SafeAreaView>;
+    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}><UI.TopProfile/><RideXMotionSurface height={52} intensity={0.38} compact muted label="EARNINGS FLOW"/><Text style={styles.pageTitle}>Earnings</Text><Text style={styles.pageSub}>Track your income and payouts</Text><View style={styles.earningsHero}><Text style={styles.earningsLabel}>Total Net Earnings</Text><Text style={styles.earningsValue}>₹{money(earningTotals.net)}</Text><View style={styles.earnStats}><Text>₹{money(earningRows.length?earningTotals.net/earningRows.length:0)}{"\n"}Avg. per Ride</Text><Text>{earningRows.length}{"\n"}Earning Records</Text><Text>₹{money(earningTotals.commission)}{"\n"}Commission</Text></View></View><View style={styles.fourCards}><Metric title="Gross Earnings" value={`₹${money(earningTotals.gross)}`}/><Metric title="Commission" value={`₹${money(earningTotals.commission)}`}/><Metric title="Net Earnings" value={`₹${money(earningTotals.net)}`}/><Metric title="Total Rides" value={`${earningRows.length}`}/></View><Text style={styles.sectionTitle}>Recent Earnings</Text>{rows.length===0?<View style={styles.emptyState}><DriverIcon name="earnings" size={30}/><Text style={styles.sectionTitle}>No earnings yet</Text><Text style={styles.docSub}>Completed trips will populate your earnings here.</Text></View>:rows.map((r:any)=><View key={r.id} style={styles.breakRow}><Text>{new Date(r.createdAt||Date.now()).toLocaleDateString()}</Text><Text>{r.booking?.serviceSubtype||'Ride'}</Text><Text style={styles.breakFare}>₹{money(Number(r.netEarning||0))}</Text></View>)}<Primary title="Manage Payout Details" onPress={()=>setScreen("payout")}/></ScrollView><UI.BottomNav active="earnings"/></SafeAreaView>;
   }
 
   function ProfileScreen() {
-    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}><UI.Header back/><Text style={styles.pageTitle}>Driver Profile</Text><Text style={styles.pageSub}>Manage your profile, documents and settings</Text><View style={styles.profileCard}><Pressable onPress={() => setMessage("Profile photo management is available from KYC / account settings.")}><Image source={DRIVER_AVATAR} style={styles.profilePhoto}/></Pressable><View style={{flex:1}}><Text style={styles.profileName}>{driverProfile?.fullName || driverProfile?.name || driverProfile?.user?.fullName || driverProfile?.user?.name || "Driver"}</Text><Text style={styles.profileMeta}>{driverProfile?.user?.mobile || driverProfile?.mobile || driverProfile?.mobileNumber || "Mobile not available"}</Text><Text style={styles.profileRating}>★ {Number(driverProfile?.rating ?? 0).toFixed(1)} ({Number(driverProfile?.totalRides ?? 0)} rides)</Text><Text style={styles.profileMeta}>Member since {driverProfile?.createdAt ? new Date(driverProfile.createdAt).toLocaleDateString(undefined,{month:"short",year:"numeric"}) : "RideX"}</Text></View><View style={styles.profileOnline}><Text style={styles.profileOnlineText}>{online?"✓ Online":"○ Offline"}</Text></View></View><View style={styles.profileStats}>
-  <Metric title={`${Number(driverProfile?.totalRides ?? driverProfile?.ridesCount ?? earningRows.length ?? 0)}`} value="Total Rides"/>
-  <Metric title={`${Number(driverProfile?.rating ?? driverProfile?.averageRating ?? 0).toFixed(1)}`} value="Rating"/>
-  <Metric title={driverProfile?.createdAt ? formatTenure(driverProfile.createdAt) : "—"} value="With RideX"/>
-</View>{[["▣","KYC Documents","Aadhaar, PAN, Driving License, etc.",()=>setScreen("kyc")],["🚕","Vehicle Details","E-Rickshaw / Vehicle info",()=>setScreen("kyc")],["⚙","Service Mode","Passenger / Parcel / Goods / Both",()=>setScreen("serviceMode")],["▦","Bank & Payout Details","Manage your bank account",()=>setScreen("payout")],["⚙","App Settings","Notifications, Language, etc.",()=>setScreen("notifications")],["◉","Help & Support","Get help anytime",()=>setScreen("messages")]].map(x=><Pressable key={x[1] as string} style={styles.profileRow} onPress={x[3] as any}><Text style={styles.profileRowIcon}>{x[0] as string}</Text><View style={{flex:1}}><Text style={styles.profileRowTitle}>{x[1] as string}</Text><Text style={styles.profileRowSub}>{x[2] as string}</Text></View><Text style={styles.historyChevron}>›</Text></Pressable>)}<Pressable style={styles.logout} onPress={async()=>{try{await ridexFetch(`${API}/auth/logout`,{method:"POST"});}catch{} await AsyncStorage.multiRemove([DRIVER_AUTH_TOKEN_KEY,DRIVER_SESSION_KEY]); setDriverId(""); setScreen("login");}}><Text style={styles.logoutText}>⇱ Logout</Text><Text style={styles.logoutText}>›</Text></Pressable></ScrollView><UI.BottomNav active="profile"/></SafeAreaView>;
+    const activeVehicles = driverVehicles.filter((vehicle: any) =>
+      ["ACTIVE", "VERIFIED"].includes(
+        String(vehicle?.status || "").toUpperCase(),
+      ),
+    );
+
+    const hasRickshaw = activeVehicles.some(
+      (vehicle: any) =>
+        String(vehicle?.vehicleType || "").toUpperCase() ===
+        "E_RICKSHAW",
+    );
+
+    const hasPickup = activeVehicles.some(
+      (vehicle: any) =>
+        String(vehicle?.vehicleType || "").toUpperCase() ===
+          "PICKUP_TRUCK" &&
+        vehicle?.goodsEligible !== false,
+    );
+
+    const serviceOptions: Array<{
+      mode: DriverServiceMode;
+      title: string;
+      subtitle: string;
+      enabled: boolean;
+    }> = [
+      {
+        mode: "PASSENGER",
+        title: "Passenger",
+        subtitle: "Passenger rides with E-Rickshaw",
+        enabled: hasRickshaw,
+      },
+      {
+        mode: "GOODS",
+        title: "Goods",
+        subtitle: "Goods work with Pickup Truck",
+        enabled: hasPickup,
+      },
+      {
+        mode: "BOTH",
+        title: "Both",
+        subtitle: "Passenger + Goods services",
+        enabled: hasRickshaw && hasPickup,
+      },
+    ];
+
+    const driverRatingValue = Number(
+      driverProfile?.rating ??
+        driverProfile?.averageRating,
+    );
+
+    return (
+      <SafeAreaView style={styles.page}>
+        <ScrollView
+          contentContainerStyle={{
+            padding: 16,
+            paddingBottom: 120,
+          }}
+        >
+          <UI.Header back />
+
+          <Text style={styles.pageTitle}>Driver Profile</Text>
+          <Text style={styles.pageSub}>
+            Manage your profile, documents, services and settings
+          </Text>
+
+          <View style={styles.profileCard}>
+            <Pressable
+              onPress={() =>
+                setMessage(
+                  "Profile photo management is available from account/KYC controls.",
+                )
+              }
+            >
+              <Image
+                source={DRIVER_AVATAR}
+                style={styles.profilePhoto}
+              />
+            </Pressable>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.profileName}>
+                {driverProfile?.fullName ||
+                  driverProfile?.name ||
+                  driverProfile?.user?.fullName ||
+                  driverProfile?.user?.name ||
+                  "Driver"}
+              </Text>
+
+              <Text style={styles.profileMeta}>
+                {driverProfile?.user?.mobile ||
+                  driverProfile?.mobile ||
+                  driverProfile?.mobileNumber ||
+                  "Mobile not available"}
+              </Text>
+
+              <Text style={styles.profileRating}>
+                {Number.isFinite(driverRatingValue) &&
+                driverRatingValue > 0
+                  ? `★ ${driverRatingValue.toFixed(1)}`
+                  : "Rating not available"}
+              </Text>
+
+              <Text style={styles.profileMeta}>
+                Member since{" "}
+                {driverProfile?.createdAt
+                  ? new Date(
+                      driverProfile.createdAt,
+                    ).toLocaleDateString(undefined, {
+                      month: "short",
+                      year: "numeric",
+                    })
+                  : "—"}
+              </Text>
+            </View>
+
+            <View style={styles.profileOnline}>
+              <Text style={styles.profileOnlineText}>
+                {online ? "✓ Online" : "○ Offline"}
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.profileStats}>
+            <Metric
+              title={`${Number(
+                driverProfile?.totalRides ??
+                  driverProfile?.ridesCount ??
+                  earningRows.length ??
+                  0,
+              )}`}
+              value="Total Rides"
+            />
+
+            <Metric
+              title={
+                Number.isFinite(driverRatingValue) &&
+                driverRatingValue > 0
+                  ? driverRatingValue.toFixed(1)
+                  : "—"
+              }
+              value="Rating"
+            />
+
+            <Metric
+              title={
+                driverProfile?.createdAt
+                  ? formatTenure(driverProfile.createdAt)
+                  : "—"
+              }
+              value="With RideX"
+            />
+          </View>
+
+          <Pressable
+            style={styles.serviceShortcut}
+            onPress={() =>
+              setServiceModeModalVisible(true)
+            }
+          >
+            <Text style={styles.shortLabel}>
+              Working Services
+            </Text>
+            <Text style={styles.shortValue}>
+              {serviceMode === "PASSENGER"
+                ? "Passenger"
+                : serviceMode === "GOODS"
+                  ? "Goods"
+                  : "Passenger + Goods"}
+            </Text>
+            <Text style={styles.profileRowSub}>
+              Parcel:{" "}
+              {parcelServiceEnabled
+                ? "Enabled"
+                : "Disabled"}
+              {" • "}
+              Backend-controlled availability
+            </Text>
+          </Pressable>
+
+          {[
+            [
+              "▣",
+              "KYC Documents",
+              "Documents and verification status",
+              () => setScreen("kyc"),
+            ],
+            [
+              "🚕",
+              "Vehicle Details",
+              "Verified vehicle information",
+              () => setScreen("kyc"),
+            ],
+            [
+              "✓",
+              "Application Status",
+              "Approval and onboarding status",
+              () => setScreen("onboardingStatus"),
+            ],
+            [
+              "▦",
+              "Bank & Payout Details",
+              "Manage your bank account",
+              () => setScreen("payout"),
+            ],
+            [
+              "⚙",
+              "Notifications",
+              "Ride, earnings, account and system alerts",
+              () => setScreen("notifications"),
+            ],
+            [
+              "◉",
+              "Help & Support",
+              "Real RideX support cases and messages",
+              () => setScreen("messages"),
+            ],
+          ].map((item) => (
+            <Pressable
+              key={item[1] as string}
+              style={styles.profileRow}
+              onPress={item[3] as () => void}
+            >
+              <Text style={styles.profileRowIcon}>
+                {item[0] as string}
+              </Text>
+
+              <View style={{ flex: 1 }}>
+                <Text style={styles.profileRowTitle}>
+                  {item[1] as string}
+                </Text>
+                <Text style={styles.profileRowSub}>
+                  {item[2] as string}
+                </Text>
+              </View>
+
+              <Text style={styles.historyChevron}>
+                ›
+              </Text>
+            </Pressable>
+          ))}
+
+          <Pressable
+            style={styles.logout}
+            onPress={async () => {
+              try {
+                await ridexFetch(`${API}/auth/logout`, {
+                  method: "POST",
+                });
+              } catch {}
+
+              unregisterRideXPushTokenListener();
+
+              await AsyncStorage.multiRemove([
+                DRIVER_AUTH_TOKEN_KEY,
+                DRIVER_SESSION_KEY,
+              ]);
+
+              setDriverId("");
+              setActiveRide(null);
+              setLastCompletion(null);
+              setLastCompletedContext(null);
+              setRealtimeConnected(false);
+              setServiceModeModalVisible(false);
+              setScreen("login");
+            }}
+          >
+            <Text style={styles.logoutText}>
+              ⇱ Logout
+            </Text>
+            <Text style={styles.logoutText}>
+              ›
+            </Text>
+          </Pressable>
+        </ScrollView>
+
+        <Modal
+          visible={serviceModeModalVisible}
+          transparent
+          animationType="slide"
+          onRequestClose={() =>
+            !serviceModeLoading &&
+            setServiceModeModalVisible(false)
+          }
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.quickModal}>
+              <Text style={styles.quickTitle}>
+                Working Services
+              </Text>
+
+              <Text style={styles.quickSub}>
+                Select the backend-authorized services you
+                are currently available to receive.
+              </Text>
+
+              {serviceOptions.map((option) => (
+                <Pressable
+                  key={option.mode}
+                  disabled={
+                    !option.enabled ||
+                    serviceModeLoading
+                  }
+                  onPress={() =>
+                    void updateDriverServiceMode(
+                      option.mode,
+                      option.mode === "GOODS"
+                        ? false
+                        : parcelServiceEnabled,
+                    )
+                  }
+                  style={[
+                    styles.modeCard,
+                    serviceMode === option.mode &&
+                      styles.modeSelected,
+                    !option.enabled && {
+                      opacity: 0.45,
+                    },
+                  ]}
+                >
+                  <View style={styles.modeVehicleBox}>
+                    <Text style={styles.modeEmoji}>
+                      {option.mode === "GOODS"
+                        ? "🛻"
+                        : option.mode === "BOTH"
+                          ? "▱"
+                          : "🛺"}
+                    </Text>
+                  </View>
+
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.modeTitle}>
+                      {option.title}
+                    </Text>
+                    <Text style={styles.modeSub}>
+                      {option.subtitle}
+                    </Text>
+
+                    <Text style={styles.checkLine}>
+                      {option.enabled
+                        ? "✓ Backend-eligible"
+                        : "Vehicle requirement not met"}
+                    </Text>
+                  </View>
+
+                  <View style={styles.radio}>
+                    <Text>
+                      {serviceMode === option.mode
+                        ? "●"
+                        : "○"}
+                    </Text>
+                  </View>
+                </Pressable>
+              ))}
+
+              {hasRickshaw ? (
+                <Pressable
+                  disabled={serviceModeLoading}
+                  onPress={() =>
+                    void updateDriverServiceMode(
+                      serviceMode,
+                      !parcelServiceEnabled,
+                    )
+                  }
+                  style={styles.serviceShortcut}
+                >
+                  <Text style={styles.shortLabel}>
+                    Parcel Service with E-Rickshaw
+                  </Text>
+                  <Text style={styles.shortValue}>
+                    {parcelServiceEnabled
+                      ? "Enabled"
+                      : "Disabled"}
+                  </Text>
+                  <Text style={styles.profileRowSub}>
+                    Backend validates the final mode and
+                    vehicle eligibility.
+                  </Text>
+                </Pressable>
+              ) : null}
+
+              <View style={styles.buttonRow}>
+                <Outline
+                  title="Close"
+                  onPress={() =>
+                    !serviceModeLoading &&
+                    setServiceModeModalVisible(false)
+                  }
+                />
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        <UI.BottomNav active="profile" />
+      </SafeAreaView>
+    );
   }
 
   function KycScreen() {
+    const requiredTypes = [
+      "AADHAAR",
+      "PAN",
+      "DRIVING_LICENSE",
+      "SELFIE",
+    ];
+
     const vehicle = driverVehicles[0];
-    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}>
-      <UI.Header back/><Text style={styles.pageTitle}>KYC & Vehicle Details</Text><Text style={styles.pageSub}>Manage verified documents and vehicle information</Text>
-      <View style={styles.sectionBar}><View style={styles.sectionTitleWrap}><DriverIcon name="kyc" size={18}/><Text style={styles.sectionTitle}>KYC Documents</Text></View><Text style={styles.verified}>{vehicle ? "Driver account linked" : "Pending"}</Text></View>
-      {["AADHAAR","PAN","DRIVING_LICENSE","SELFIE"].map(type=>{
-        const doc:any=(driverDocuments||[]).find((d:any)=>String(d.documentType||"").toUpperCase()===type);
-        const label=type==="AADHAAR"?"Aadhaar Card":type==="PAN"?"PAN Card":type==="DRIVING_LICENSE"?"Driving License":"Selfie / Live Photo";
-        const approved=String(doc?.status||"").toUpperCase()==="APPROVED";
-        return <View key={type} style={styles.docRow}>
-          <View style={styles.docIcon}><DriverIcon name="document" size={22}/></View>
-          <View style={{flex:1}}><Text style={styles.docTitle}>{label}</Text><Text style={styles.docSub}>{doc?.status || "Not submitted"}</Text></View>
-          {doc ? (approved ? <View style={styles.docStatusIcon}><DriverIcon name="check" size={20}/></View> : <Primary title={actionLoading===`kyc-upload-${type}`?"Uploading…":doc?.fileUrl?"Replace":"Upload"} onPress={()=>void uploadKycDocument(doc.id,type)}/>) : <Text style={styles.docSub}>No document slot</Text>}
-        </View>;
-      })}
-      <View style={styles.sectionBar}><View style={styles.sectionTitleWrap}><DriverIcon name="vehicle" size={18}/><Text style={styles.sectionTitle}>Vehicle Details</Text></View><Text style={styles.verified}>{vehicle?.status || "Pending"}</Text></View>
-      {vehicle ? <View style={styles.vehicleEditCard}><View style={styles.docRow}><View style={styles.docIcon}><DriverIcon name="vehicle" size={22}/></View><View style={{flex:1}}><Text style={styles.docTitle}>{vehicle.vehicleType}</Text><Text style={styles.docSub}>{vehicle.vehicleNumber} • Capacity {vehicle.capacity}</Text></View></View><Primary title="Edit Vehicle Details" onPress={()=>{setEditingVehicle(vehicle);setVehicleNumberInput(String(vehicle.vehicleNumber||""));setVehicleCapacityInput(String(vehicle.capacity||""));}}/></View> : <Text style={styles.docSub}>No vehicle is linked yet.</Text>}
-      {editingVehicle ? <View style={styles.editPanel}><Text style={styles.sectionTitle}>Edit Vehicle</Text><TextInput value={vehicleNumberInput} onChangeText={setVehicleNumberInput} placeholder="Vehicle number" style={styles.formInput}/><TextInput value={vehicleCapacityInput} onChangeText={setVehicleCapacityInput} placeholder="Capacity" keyboardType="numeric" style={styles.formInput}/><View style={styles.buttonRow}><Outline title="Cancel" onPress={()=>setEditingVehicle(null)}/><Primary title={actionLoading==="vehicle-save"?"Saving…":"Save"} onPress={()=>void saveVehicle(editingVehicle.id)}/></View></View>:null}
-    </ScrollView></SafeAreaView>;
+
+    return (
+      <SafeAreaView style={styles.page}>
+        <ScrollView
+          contentContainerStyle={{
+            padding: 16,
+            paddingBottom: 120,
+          }}
+        >
+          <UI.Header back />
+
+          <Text style={styles.pageTitle}>
+            KYC & Vehicle
+          </Text>
+
+          <Text style={styles.pageSub}>
+            Upload required documents, add your vehicle, then submit
+            the application.
+          </Text>
+
+          <View style={styles.infoBlue}>
+            <Text style={styles.infoBlueTitle}>
+              Verification status
+            </Text>
+            <Text>
+              {String(
+                onboardingStatus?.verificationStatus ||
+                  driverProfile?.verificationStatus ||
+                  "PENDING",
+              )}
+            </Text>
+          </View>
+
+          <View style={styles.sectionBar}>
+            <View style={styles.sectionTitleWrap}>
+              <DriverIcon name="kyc" size={18} />
+              <Text style={styles.sectionTitle}>
+                Documents
+              </Text>
+            </View>
+
+            <Text style={styles.verified}>
+              {
+                driverDocuments.filter(
+                  (document: any) =>
+                    Boolean(document?.fileUrl),
+                ).length
+              }
+              /{requiredTypes.length} uploaded
+            </Text>
+          </View>
+
+          {requiredTypes.map((type) => {
+            const doc: any = (
+              driverDocuments || []
+            ).find(
+              (item: any) =>
+                String(
+                  item?.documentType || "",
+                ).toUpperCase() === type,
+            );
+
+            const label =
+              type === "AADHAAR"
+                ? "Aadhaar Card"
+                : type === "PAN"
+                  ? "PAN Card"
+                  : type === "DRIVING_LICENSE"
+                    ? "Driving License"
+                    : "Selfie / Live Photo";
+
+            const approved =
+              String(
+                doc?.status || "",
+              ).toUpperCase() === "APPROVED";
+
+            const expiryValue =
+              doc?.expiresAt ??
+              doc?.expiryDate ??
+              doc?.validUntil ??
+              null;
+
+            const expiryDate = expiryValue
+              ? new Date(String(expiryValue))
+              : null;
+
+            const expiryValid = Boolean(
+              expiryDate &&
+                Number.isFinite(
+                  expiryDate.getTime(),
+                ),
+            );
+
+            const expired =
+              expiryValid &&
+              expiryDate!.getTime() <= Date.now();
+
+            const expiryLabel = expiryValid
+              ? ` • ${
+                  expired
+                    ? "Expired"
+                    : `Valid until ${expiryDate!.toLocaleDateString()}`
+                }`
+              : "";
+
+            return (
+              <View
+                key={type}
+                style={styles.docRow}
+              >
+                <View style={styles.docIcon}>
+                  <DriverIcon
+                    name="document"
+                    size={22}
+                  />
+                </View>
+
+                <View
+                  style={{ flex: 1 }}
+                >
+                  <Text style={styles.docTitle}>
+                    {label}
+                  </Text>
+
+                  <Text style={styles.docSub}>
+                    {doc
+                      ? `${doc.status || "PENDING"}${
+                          doc.rejectionReason
+                            ? ` • ${doc.rejectionReason}`
+                            : ""
+                        }${expiryLabel}`
+                      : "Not created"}
+                  </Text>
+                </View>
+
+                {doc ? (
+                  approved && !expired ? (
+                    <View
+                      style={
+                        styles.docStatusIcon
+                      }
+                    >
+                      <DriverIcon
+                        name="check"
+                        size={20}
+                      />
+                    </View>
+                  ) : (
+                    <Primary
+                      title={
+                        actionLoading ===
+                        `kyc-upload-${type}`
+                          ? "Uploading…"
+                          : expired
+                            ? "Re-upload"
+                            : doc.fileUrl
+                              ? "Replace"
+                              : "Upload"
+                      }
+                      onPress={() =>
+                        void uploadKycDocument(
+                          doc.id,
+                          type,
+                        )
+                      }
+                    />
+                  )
+                ) : (
+                  <Primary
+                    title={
+                      actionLoading ===
+                      `doc-create-${type}`
+                        ? "Preparing…"
+                        : "Create"
+                    }
+                    onPress={() =>
+                      void createDocumentSlot(type)
+                    }
+                  />
+                )}
+              </View>
+            );
+          })}
+
+          <View style={styles.sectionBar}>
+            <View style={styles.sectionTitleWrap}>
+              <DriverIcon
+                name="vehicle"
+                size={18}
+              />
+              <Text style={styles.sectionTitle}>
+                Vehicle
+              </Text>
+            </View>
+
+            <Text style={styles.verified}>
+              {vehicle?.status || "Not added"}
+            </Text>
+          </View>
+
+          {vehicle ? (
+            <View style={styles.vehicleEditCard}>
+              <View style={styles.docRow}>
+                <View style={styles.docIcon}>
+                  <DriverIcon
+                    name="vehicle"
+                    size={22}
+                  />
+                </View>
+
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.docTitle}>
+                    {vehicle.vehicleType}
+                  </Text>
+
+                  <Text style={styles.docSub}>
+                    {vehicle.vehicleNumber} • Capacity{" "}
+                    {vehicle.capacity} •{" "}
+                    {vehicle.goodsEligible
+                      ? "Goods eligible"
+                      : "Passenger/Parcel"}
+                  </Text>
+                </View>
+              </View>
+
+              <Primary
+                title="Edit Vehicle Details"
+                onPress={() => {
+                  setEditingVehicle(vehicle);
+                  setVehicleNumberInput(
+                    String(
+                      vehicle.vehicleNumber ||
+                        "",
+                    ),
+                  );
+                  setVehicleCapacityInput(
+                    String(
+                      vehicle.capacity || "",
+                    ),
+                  );
+                }}
+              />
+            </View>
+          ) : (
+            <View style={styles.editPanel}>
+              <Text style={styles.sectionTitle}>
+                Add Vehicle
+              </Text>
+
+              <View style={styles.filterRow}>
+                {[
+                  [
+                    "E_RICKSHAW",
+                    "E-Rickshaw",
+                  ],
+                  [
+                    "PICKUP_TRUCK",
+                    "Pickup Truck",
+                  ],
+                ].map(
+                  ([key, label]) => (
+                    <Pressable
+                      key={key}
+                      onPress={() => {
+                        setNewVehicleType(
+                          key,
+                        );
+                        setNewVehicleGoodsEligible(
+                          key ===
+                            "PICKUP_TRUCK",
+                        );
+                      }}
+                      style={[
+                        styles.filterPill,
+                        newVehicleType ===
+                          key &&
+                          styles.filterActive,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.filterText,
+                          newVehicleType ===
+                            key &&
+                            styles.filterActiveText,
+                        ]}
+                      >
+                        {label}
+                      </Text>
+                    </Pressable>
+                  ),
+                )}
+              </View>
+
+              <Text style={styles.fieldLabel}>
+                Vehicle Number
+              </Text>
+
+              <TextInput
+                value={newVehicleNumber}
+                onChangeText={
+                  setNewVehicleNumber
+                }
+                autoCapitalize="characters"
+                placeholder="Vehicle number"
+                style={styles.formInput}
+              />
+
+              <Text style={styles.fieldLabel}>
+                Capacity
+              </Text>
+
+              <TextInput
+                value={newVehicleCapacity}
+                onChangeText={
+                  setNewVehicleCapacity
+                }
+                keyboardType="numeric"
+                placeholder="Capacity"
+                style={styles.formInput}
+              />
+
+              <Primary
+                title={
+                  actionLoading ===
+                  "vehicle-create"
+                    ? "Submitting…"
+                    : "Add Vehicle"
+                }
+                disabled={
+                  actionLoading ===
+                  "vehicle-create"
+                }
+                onPress={() =>
+                  void createDriverVehicle()
+                }
+              />
+
+              <Text style={styles.docSub}>
+                Vehicle starts in pending verification
+                state. Admin approval is required.
+              </Text>
+            </View>
+          )}
+
+          {editingVehicle ? (
+            <View style={styles.editPanel}>
+              <Text style={styles.sectionTitle}>
+                Edit Vehicle
+              </Text>
+
+              <TextInput
+                value={vehicleNumberInput}
+                onChangeText={
+                  setVehicleNumberInput
+                }
+                placeholder="Vehicle number"
+                style={styles.formInput}
+              />
+
+              <TextInput
+                value={vehicleCapacityInput}
+                onChangeText={
+                  setVehicleCapacityInput
+                }
+                placeholder="Capacity"
+                keyboardType="numeric"
+                style={styles.formInput}
+              />
+
+              <View style={styles.buttonRow}>
+                <Outline
+                  title="Cancel"
+                  onPress={() =>
+                    setEditingVehicle(
+                      null,
+                    )
+                  }
+                />
+
+                <Primary
+                  title={
+                    actionLoading ===
+                    "vehicle-save"
+                      ? "Saving…"
+                      : "Save"
+                  }
+                  onPress={() =>
+                    void saveVehicle(
+                      editingVehicle.id,
+                    )
+                  }
+                />
+              </View>
+            </View>
+          ) : null}
+
+          <Primary
+            title="Refresh Application Status"
+            onPress={() =>
+              void loadOnboardingStatus(
+                driverId,
+              )
+            }
+          />
+
+          {onboardingStatus?.canSubmit ? (
+            <Primary
+              title={
+                actionLoading ===
+                "onboarding-submit"
+                  ? "Submitting…"
+                  : "Review & Submit Application"
+              }
+              disabled={
+                actionLoading ===
+                "onboarding-submit"
+              }
+              onPress={() =>
+                void submitDriverOnboarding()
+              }
+            />
+          ) : (
+            <Text style={styles.docSub}>
+              Upload every required document and add a
+              vehicle before Review & Submit becomes
+              available.
+            </Text>
+          )}
+        </ScrollView>
+      </SafeAreaView>
+    );
   }
 
   function PayoutScreen() {
@@ -2820,11 +4696,355 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
   }
 
   function SafetyScreen() {
-    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}><UI.Header back/><Text style={styles.pageTitle}>Safety & Support</Text><Text style={styles.pageSub}>Your safety is our priority</Text><View style={styles.safetyHero}><View style={{flex:1}}><Text style={styles.safetyTitle}>Drive Safe, Stay Secure</Text><Text style={styles.safetySub}>We are always here for you</Text></View><Text style={styles.safetyPerson}>👨🏻</Text></View><View style={styles.safetyTiles}><Pressable style={styles.safetyTileRed} onPress={()=>void triggerDriverSos()}><Text style={styles.safetyCircle}>SOS</Text><Text style={styles.safetyTileTitle}>Emergency SOS</Text><Text style={styles.tileSub}>Get help instantly</Text></Pressable><Pressable style={styles.safetyTileGreen} onPress={()=>setScreen("messages")}><Text style={styles.safetyCircle}>☎</Text><Text style={styles.safetyTileTitle}>Call Support</Text><Text style={styles.tileSub}>Talk to our team</Text></Pressable><Pressable style={styles.safetyTileBlue} onPress={()=>setScreen("messages")}><Text style={styles.safetyCircle}>▤</Text><Text style={styles.safetyTileTitle}>Live Chat</Text><Text style={styles.tileSub}>Chat with support</Text></Pressable></View>{["Share Live Location","Emergency Contacts","Safety Tips","Report an Issue","Help Center","App Guidelines"].map(x=><Pressable key={x} style={styles.safetyRow} onPress={()=>setScreen("messages")}><View style={styles.safetyRowIcon}><Text>✓</Text></View><View style={{flex:1}}><Text style={styles.profileRowTitle}>{x}</Text><Text style={styles.profileRowSub}>Tap to manage or view details</Text></View><Text>›</Text></Pressable>)}<View style={styles.safetyFooter}><Text style={styles.safetyFooterTitle}>✓ You are not alone</Text><Text style={styles.safetyFooterSub}>Our team is available 24/7 to support you</Text></View></ScrollView><UI.BottomNav active="home"/></SafeAreaView>;
+    return (
+      <SafeAreaView style={styles.page}>
+        <ScrollView
+          contentContainerStyle={{
+            padding: 16,
+            paddingBottom: 120,
+          }}
+        >
+          <UI.Header back />
+
+          <Text style={styles.pageTitle}>
+            Safety & Support
+          </Text>
+
+          <Text style={styles.pageSub}>
+            Real RideX safety and support controls
+          </Text>
+
+          <View style={styles.safetyHero}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.safetyTitle}>
+                Drive Safe, Stay Secure
+              </Text>
+
+              <Text style={styles.safetySub}>
+                Use SOS or contact RideX Support when
+                needed.
+              </Text>
+            </View>
+
+            <Text style={styles.safetyPerson}>
+              👨🏻
+            </Text>
+          </View>
+
+          <View style={styles.safetyTiles}>
+            <Pressable
+              style={styles.safetyTileRed}
+              onPress={() =>
+                void triggerDriverSos()
+              }
+            >
+              <Text style={styles.safetyCircle}>
+                SOS
+              </Text>
+              <Text style={styles.safetyTileTitle}>
+                Emergency SOS
+              </Text>
+              <Text style={styles.tileSub}>
+                Send a real SOS request
+              </Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.safetyTileGreen}
+              onPress={() =>
+                void callDriverSupport()
+              }
+            >
+              <Text style={styles.safetyCircle}>
+                ☎
+              </Text>
+              <Text style={styles.safetyTileTitle}>
+                Call Support
+              </Text>
+              <Text style={styles.tileSub}>
+                Use configured support line
+              </Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.safetyTileBlue}
+              onPress={() =>
+                setScreen("messages")
+              }
+            >
+              <Text style={styles.safetyCircle}>
+                ▤
+              </Text>
+              <Text style={styles.safetyTileTitle}>
+                Live Chat
+              </Text>
+              <Text style={styles.tileSub}>
+                Open RideX Support
+              </Text>
+            </Pressable>
+          </View>
+
+          <Pressable
+            style={styles.safetyRow}
+            onPress={() =>
+              void sendGpsNow()
+            }
+          >
+            <View style={styles.safetyRowIcon}>
+              <Text>●</Text>
+            </View>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.profileRowTitle}>
+                Share Live Location
+              </Text>
+
+              <Text style={styles.profileRowSub}>
+                Send current verified GPS location to
+                RideX backend
+              </Text>
+            </View>
+
+            <Text>›</Text>
+          </Pressable>
+
+          <Pressable
+            style={styles.safetyRow}
+            onPress={() =>
+              setMessage(
+                "Emergency-contact management is not exposed by the supplied backend contract.",
+              )
+            }
+          >
+            <View style={styles.safetyRowIcon}>
+              <Text>☎</Text>
+            </View>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.profileRowTitle}>
+                Emergency Contacts
+              </Text>
+
+              <Text style={styles.profileRowSub}>
+                Backend contact-management endpoint is
+                not configured
+              </Text>
+            </View>
+
+            <Text>›</Text>
+          </Pressable>
+
+          <Pressable
+            style={styles.safetyRow}
+            onPress={() =>
+              setMessage(
+                "Safety tips: follow traffic rules, never share OTPs, and use SOS only for genuine emergencies.",
+              )
+            }
+          >
+            <View style={styles.safetyRowIcon}>
+              <Text>✓</Text>
+            </View>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.profileRowTitle}>
+                Safety Tips
+              </Text>
+
+              <Text style={styles.profileRowSub}>
+                Core Driver safety guidance
+              </Text>
+            </View>
+
+            <Text>›</Text>
+          </Pressable>
+
+          <Pressable
+            style={styles.safetyRow}
+            onPress={async () => {
+              const ok =
+                await createDriverSupportCase(
+                  "Driver Safety Issue",
+                  "Driver reported a safety issue from the Driver App.",
+                  "HIGH",
+                );
+
+              if (ok) {
+                await loadSupportCases(
+                  driverId,
+                );
+                setScreen("messages");
+              }
+            }}
+          >
+            <View style={styles.safetyRowIcon}>
+              <Text>!</Text>
+            </View>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.profileRowTitle}>
+                Report an Issue
+              </Text>
+
+              <Text style={styles.profileRowSub}>
+                Create a real RideX support case
+              </Text>
+            </View>
+
+            <Text>›</Text>
+          </Pressable>
+
+          <Pressable
+            style={styles.safetyRow}
+            onPress={() =>
+              setScreen("messages")
+            }
+          >
+            <View style={styles.safetyRowIcon}>
+              <Text>?</Text>
+            </View>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.profileRowTitle}>
+                Help Center
+              </Text>
+
+              <Text style={styles.profileRowSub}>
+                Open backend-connected support
+              </Text>
+            </View>
+
+            <Text>›</Text>
+          </Pressable>
+
+          <Pressable
+            style={styles.safetyRow}
+            onPress={() =>
+              setMessage(
+                "Driver Guidelines: keep KYC and vehicle details valid, follow RideX trip verification, and never share security credentials.",
+              )
+            }
+          >
+            <View style={styles.safetyRowIcon}>
+              <Text>i</Text>
+            </View>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.profileRowTitle}>
+                App Guidelines
+              </Text>
+
+              <Text style={styles.profileRowSub}>
+                Driver security and operating guidance
+              </Text>
+            </View>
+
+            <Text>›</Text>
+          </Pressable>
+
+          <View style={styles.safetyFooter}>
+            <Text style={styles.safetyFooterTitle}>
+              ✓ RideX Safety
+            </Text>
+
+            <Text style={styles.safetyFooterSub}>
+              SOS, GPS, support messages and incident
+              actions remain backend-authoritative.
+            </Text>
+          </View>
+        </ScrollView>
+
+        <UI.BottomNav active="home" />
+      </SafeAreaView>
+    );
   }
 
   function SosScreen() {
-    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={styles.authScroll}><UI.Header back/><Text style={styles.pageTitle}>Emergency SOS</Text><Text style={styles.pageSub}>We are getting you help</Text><Pressable style={styles.sosBig} onPress={()=>void triggerDriverSos()}><Text style={styles.sosPhone}>☎</Text><Text style={styles.sosBigText}>SOS</Text></Pressable><Text style={styles.sosAlert}>Emergency Alert Sent</Text><Text style={styles.sosHelp}>Help is on the way</Text><View style={styles.sosPanel}><Text>🚨 Your live location has been shared with</Text><Text>✓ RideX Support Team</Text><Text>✓ Your Emergency Contacts</Text><Text>✓ Local Police (112)</Text></View><View style={styles.locationBox}><Text style={styles.sectionTitle}>Your Current Location</Text><Text>{pickup}</Text><Outline title="View on Map" onPress={goHome}/></View><Pressable style={styles.cancelSos} onPress={()=>setScreen("safety")}><Text style={styles.cancelSosText}>■ Cancel SOS</Text></Pressable><View style={styles.infoBlue}><Text style={styles.infoBlueTitle}>ⓘ Important</Text><Text>Use SOS only in genuine emergency situations.</Text></View></ScrollView></SafeAreaView>;
+    return (
+      <SafeAreaView style={styles.page}>
+        <ScrollView
+          contentContainerStyle={styles.authScroll}
+        >
+          <UI.Header back />
+
+          <Text style={styles.pageTitle}>
+            Emergency SOS
+          </Text>
+
+          <Text style={styles.pageSub}>
+            Your SOS request has been sent through the
+            RideX safety workflow.
+          </Text>
+
+          <View style={styles.sosBig}>
+            <Text style={styles.sosPhone}>☎</Text>
+            <Text style={styles.sosBigText}>
+              SOS
+            </Text>
+          </View>
+
+          <Text style={styles.sosAlert}>
+            SOS Request Sent
+          </Text>
+
+          <Text style={styles.sosHelp}>
+            RideX Safety has received the request.
+          </Text>
+
+          <View style={styles.sosPanel}>
+            <Text>
+              🚨 Current verified GPS location was
+              attached to the SOS request.
+            </Text>
+            <Text>✓ RideX Safety workflow</Text>
+            <Text>
+              ✓ Backend incident/audit processing
+            </Text>
+          </View>
+
+          <View style={styles.locationBox}>
+            <Text style={styles.sectionTitle}>
+              Current GPS Context
+            </Text>
+
+            <Text>
+              {gpsEnabled
+                ? `${gpsLatitude.toFixed(6)}, ${gpsLongitude.toFixed(6)}`
+                : "Current GPS is not available"}
+            </Text>
+
+            <Outline
+              title="Back to Home"
+              onPress={goHome}
+            />
+          </View>
+
+          <Pressable
+            style={styles.cancelSos}
+            onPress={() =>
+              setScreen("safety")
+            }
+          >
+            <Text style={styles.cancelSosText}>
+              Close SOS View
+            </Text>
+          </Pressable>
+
+          <View style={styles.infoBlue}>
+            <Text style={styles.infoBlueTitle}>
+              ⓘ Important
+            </Text>
+
+            <Text>
+              Use SOS only for genuine emergencies. SOS
+              cancellation is not represented as completed
+              unless the backend exposes a cancellation
+              action.
+            </Text>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
   }
 
   function NotificationsScreen() {
@@ -2849,8 +5069,18 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
   }
 
   function MessagesScreen() {
-    const msgs=[["Priya Sharma","I am near the main gate","08:14 PM","2"],["Rahul Verma","Thanks for the ride! 👍","Yesterday","1"],["RideX Support","Your query has been resolved....","Yesterday",""],["RideX Updates","New Incentive Scheme is Live!","2 Sep",""],["Neha Singh","Where are you?","1 Sep",""],["Amit Kumar","Please come to the back side","31 Aug",""]];
-    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}}><UI.TopProfile/><Text style={styles.pageTitle}>Messages & Support</Text><Text style={styles.pageSub}>Chat with riders and get help from our support team</Text><View style={styles.filterRow}>{["Chats","Support","FAQ"].map((x,i)=><Pressable key={x} style={[styles.filterPill,i===0&&styles.filterActive]}><Text style={[styles.filterText,i===0&&styles.filterActiveText]}>{x}</Text></Pressable>)}</View>{msgs.map(m=><Pressable key={m[0]} style={styles.messageRow}><View style={styles.messageAvatar}><Text>{m[0]==="Priya Sharma"?"PS":m[0]==="Rahul Verma"?"RV":"●"}</Text></View><View style={{flex:1}}><Text style={styles.messageName}>{m[0]}</Text><Text style={styles.messagePreview}>{m[1]}</Text></View><View><Text style={styles.messageTime}>{m[2]}</Text>{m[3]?<Text style={styles.unread}>{m[3]}</Text>:null}</View><Text>›</Text></Pressable>)}<View style={styles.supportBox}><Text style={styles.supportTitle}>Need Help?</Text><Text style={styles.supportSub}>Our support team is available 24/7 to help you with any issue.</Text><Primary title="Chat with Support" onPress={()=>void createDriverSupportCase("Live Chat", "Driver requested live support chat.", "NORMAL")}/></View><View style={styles.supportActions}><Outline title="Call Support" onPress={()=>void callDriverSupport()}/><Outline title="Raise a Ticket" onPress={()=>void createDriverSupportCase("Driver Support Ticket", "Driver raised a support ticket from the Messages & Support screen.", "HIGH")}/></View></ScrollView><UI.BottomNav active="messages"/></SafeAreaView>;
+    const selectedCase = supportCases.find((x:any)=>x.id===selectedSupportCaseId) || supportCases[0] || null;
+    const messages = Array.isArray(selectedCase?.messages) ? selectedCase.messages : [];
+    return <SafeAreaView style={styles.page}><ScrollView contentContainerStyle={{padding:16,paddingBottom:120}} keyboardShouldPersistTaps="handled">
+      <UI.TopProfile/><View style={{flexDirection:"row",alignItems:"center",justifyContent:"space-between"}}><View><Text style={styles.pageTitle}>Messages & Support</Text><Text style={styles.pageSub}>Real RideX support cases and messages</Text></View><Pressable onPress={()=>void loadSupportCases(driverId)}><Text style={styles.markAllText}>Refresh</Text></Pressable></View>
+      {supportCases.length===0?<View style={styles.emptyState}><DriverIcon name="support" size={30}/><Text style={styles.sectionTitle}>No support cases</Text><Text style={styles.docSub}>Create a support request below when you need help.</Text></View>:<>
+        <Text style={styles.sectionTitle}>Your Support Cases</Text>
+        {supportCases.map((c:any)=><Pressable key={c.id} onPress={()=>setSelectedSupportCaseId(c.id)} style={[styles.messageRow,selectedCase?.id===c.id&&styles.notificationUnread]}><View style={styles.messageAvatar}><Text>RX</Text></View><View style={{flex:1}}><Text style={styles.messageName}>{c.subject}</Text><Text style={styles.messagePreview}>{c.description}</Text></View><Text style={styles.messageTime}>{String(c.status||"")}</Text></Pressable>)}
+        {selectedCase?<View style={styles.supportBox}><Text style={styles.supportTitle}>{selectedCase.subject}</Text><Text style={styles.supportSub}>{selectedCase.description}</Text>{messages.length===0?<Text style={styles.docSub}>No messages yet.</Text>:messages.map((m:any)=><View key={m.id} style={{paddingVertical:8}}><Text style={styles.messagePreview}>{m.message}</Text><Text style={styles.messageTime}>{m.createdAt ? new Date(m.createdAt).toLocaleString() : ""}</Text>{m.attachmentUrl ? <Outline title="Open Attachment" onPress={()=>void openSupportAttachment(m.id)} /> : null}</View>)}<TextInput value={supportDraft} onChangeText={setSupportDraft} placeholder="Write a message to RideX Support" multiline style={[styles.formInput,{minHeight:80,textAlignVertical:"top"}]} /><Primary title={actionLoading==="support-message"?"Sending…":"Send Message"} disabled={!supportDraft.trim() || actionLoading==="support-message"} onPress={()=>void sendSupportMessage()} /><Outline title={actionLoading==="support-attachment"?"Uploading…":"Attach File"} onPress={()=>void sendSupportAttachment()} /></View>:null}
+      </>}
+      <View style={styles.supportBox}><Text style={styles.supportTitle}>Need Help?</Text><Text style={styles.supportSub}>Support cases are stored in RideX and remain visible to authorized Admin staff.</Text><Primary title={actionLoading==="support"?"Creating…":"Create Support Case"} disabled={actionLoading==="support"} onPress={async()=>{const ok=await createDriverSupportCase("Driver Support", "Driver requested support from the Driver App.", "NORMAL"); if(ok) await loadSupportCases(driverId);}}/></View>
+      <View style={styles.supportActions}><Outline title="Call Support" onPress={()=>void callDriverSupport()}/><Outline title="Report Ride Issue" onPress={()=>void createDriverSupportCase("Ride Issue", "Driver reported an issue with the current ride.", "HIGH")}/></View>
+    </ScrollView><UI.BottomNav active="messages"/></SafeAreaView>;
   }
 
   return (
@@ -2858,9 +5088,10 @@ startAt = "login", onBackToCustomer}: {startAt?: "welcome" | "login"; onBackToCu
       {incomingRequest && screen !== "request" ? <Modal transparent visible animationType="slide" onRequestClose={()=>setIncomingRequest(null)}><View style={styles.modalOverlay}><View style={styles.quickModal}><Text style={styles.quickTitle}>New Ride Request</Text><Text style={styles.quickSub}>A new ride request is nearby!</Text><View style={styles.acceptRow}><Pressable style={styles.decline} onPress={()=>setIncomingRequest(null)}><Text style={styles.declineText}>Later</Text></Pressable><Pressable style={styles.accept} onPress={()=>setScreen("request")}><Text style={styles.acceptText}>View Request</Text></Pressable></View></View></View></Modal> : null}
       {screen==="welcome"&&WelcomeScreen()}
       {screen==="login"&&LoginScreen()}
+      {screen==="registration"&&RegistrationScreen()}
+      {screen==="onboardingStatus"&&OnboardingStatusScreen()}
       {screen==="otp"&&OtpScreen()}
       {screen==="home"&&HomeScreen()}
-      {screen==="serviceMode"&&ServiceModeScreen()}
       {screen==="request"&&RequestScreen()}
       {screen==="accepted"&&ActiveRide({kind:"accepted"})}
       {screen==="arrived"&&ActiveRide({kind:"arrived"})}
